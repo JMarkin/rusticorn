@@ -1,3 +1,3 @@
 ## Rusticorn
 
-Experemental python ASGI server writen by Rust
+Experemental ASGI server for python wroten by Rust
