@@ -1,0 +1,20 @@
+[package]
+name = "rusticorn"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rusticorn"
+crate-type = ["cdylib"]
+
+[dependencies]
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+pyo3 = { version = "0.17.3", features = ["extension-module"] }
+pyo3-asyncio = { version = "0.17", features = ["attributes", "tokio-runtime"] }
+pyo3-log = "0.7.0"
+log = "0.4.17"
+futures-util = "0.3.25"
+urlencoding = "2.1.2"
+anyhow = "1.0.66"
