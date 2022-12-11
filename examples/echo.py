@@ -1,5 +1,4 @@
 import asyncio
-import rusticorn
 import logging
 
 FORMAT = '%(message)s'
@@ -25,10 +24,7 @@ async def app(scope, receive, send):
         'body': body.encode('utf-8'),
     })
 
-async def main():
-    await rusticorn.start_app(app)
-
-
-
 if __name__ == '__main__':
-    asyncio.run(main())
+    import rusticorn
+
+    rusticorn.run(app, "0.0.0.0:8000")
