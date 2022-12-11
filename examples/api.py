@@ -6,9 +6,9 @@ from pydantic import BaseModel
 import asyncio
 import logging
 
-# FORMAT = '%(message)s'
-# logging.basicConfig(format=FORMAT)
-# logging.getLogger().setLevel(logging.DEBUG)
+FORMAT = '%(message)s'
+logging.basicConfig(format=FORMAT)
+logging.getLogger().setLevel(logging.DEBUG)
 
 app = FastAPI()
 
