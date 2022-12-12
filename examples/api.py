@@ -1,4 +1,5 @@
 from typing import Union
+import os
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -8,7 +9,7 @@ import logging
 
 FORMAT = '%(message)s'
 logging.basicConfig(format=FORMAT)
-logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().setLevel(os.getenv('LOG_LEVEL', 'DEBUG'))
 
 app = FastAPI()
 

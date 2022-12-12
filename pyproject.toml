@@ -20,4 +20,5 @@ dev = [
     "fastapi>=0.88.0",
     "uvicorn>=0.20.0",
     "maturin>=0.14.5",
+    "locust>=2.13.2",
 ]

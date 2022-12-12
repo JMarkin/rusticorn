@@ -20,7 +20,7 @@ use crate::scope::configure_scope;
 #[derive(Debug)]
 pub struct ASGIRequest {
     pub send: AsyncSender<SendTypes>,
-    pub receive: (AsyncReceiver<ReceiveTypes>, AsyncSender<bool>),
+    pub receive: AsyncSender<AsyncSender<ReceiveTypes>>,
     pub scope: Py<PyAny>,
 }
 
@@ -45,15 +45,14 @@ async fn call(
     let mut response = Response::default();
     let mut buf: Vec<u8> = vec![];
     let (send_tx, send_rx) = unbounded::<SendTypes>();
-    let (recv_tx, recv_rx) = unbounded::<ReceiveTypes>();
-    let (recv_enabled_tx, recv_enabled_rx) = unbounded::<bool>();
+    let (recv_tx, recv_rx) = unbounded::<AsyncSender<ReceiveTypes>>();
 
     let scope = Python::with_gil(|py| configure_scope(py, &req, addr).unwrap().to_object(py));
     req_tx
         .send(ASGIRequest {
             scope,
             send: send_tx,
-            receive: (recv_rx, recv_enabled_tx),
+            receive: recv_tx,
         })
         .await
         .unwrap();
@@ -61,24 +60,23 @@ async fn call(
     let wait_parse_request = tokio::spawn(async move {
         let mut chunk_stream = req.into_body();
 
-        while recv_enabled_rx.recv().await.is_ok() {
+        while let Ok(tx) = recv_rx.recv().await {
             let chunk = chunk_stream.data().await;
             if let Some(chunk) = chunk {
                 match chunk {
                     Err(e) => {
                         warn!("{}", e.to_string());
-                        recv_tx.send(ReceiveTypes::HttpDisconect).await.unwrap();
+                        tx.send(ReceiveTypes::HttpDisconect).await.unwrap();
                         break;
                     }
                     Ok(data) => {
                         let more_body = !chunk_stream.is_end_stream();
-                        recv_tx
-                            .send(ReceiveTypes::HttpRequst(ReceiveRequest {
-                                body: data.into(),
-                                more_body,
-                            }))
-                            .await
-                            .unwrap();
+                        tx.send(ReceiveTypes::HttpRequst(ReceiveRequest {
+                            body: data.into(),
+                            more_body,
+                        }))
+                        .await
+                        .unwrap();
                     }
                 }
             } else {

@@ -22,10 +22,7 @@ fn start_app<'a>(py: Python<'a>, app: &'a PyAny, bind: Option<&'a str>) -> PyRes
         });
         while let Ok(areq) = req_rx.recv().await {
             let send = SendMethod { tx: areq.send };
-            let receive = Receive {
-                rx: areq.receive.0,
-                tx: areq.receive.1,
-            };
+            let receive = Receive { tx: areq.receive };
 
             let fut = Python::with_gil(|py| {
                 let scope = areq.scope;

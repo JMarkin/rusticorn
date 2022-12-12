@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import os
 
 FORMAT = '%(message)s'
 logging.basicConfig(format=FORMAT)
-logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().setLevel(os.getenv('LOG_LEVEL', 'DEBUG'))
 
 async def app(scope, receive, send):
     """

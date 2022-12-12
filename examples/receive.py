@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import os
 
 FORMAT = '%(message)s'
 logging.basicConfig(format=FORMAT)
-logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().setLevel(os.getenv('LOG_LEVEL', 'DEBUG'))
 
 async def read_body(receive):
     """
@@ -16,7 +17,7 @@ async def read_body(receive):
         message = await receive()
         body += message.get('body', b'')
         more_body = message.get('more_body', False)
-        print(more_body, body)
+        logging.info("%s %s", more_body, body)
 
     return body
 
