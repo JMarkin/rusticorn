@@ -9,16 +9,24 @@ use server::{start_server, ASGIRequest};
 use crate::prelude::*;
 
 #[pyfunction]
-fn start_app<'a>(py: Python<'a>, app: &'a PyAny, bind: Option<&'a str>) -> PyResult<&'a PyAny> {
+fn start_app<'a>(
+    py: Python<'a>,
+    app: &'a PyAny,
+    bind: Option<&'a str>,
+    tls: Option<bool>,
+    cert_path: Option<String>,
+    private_path: Option<String>,
+) -> PyResult<&'a PyAny> {
     let (req_tx, req_rx) = unbounded::<ASGIRequest>();
 
     let app: PyObject = app.into();
 
     let addr = bind.unwrap_or("127.0.0.1:8000").parse()?;
+    let tls = tls.unwrap_or(false);
 
     pyo3_asyncio::tokio::future_into_py(py, async move {
         tokio::spawn(async move {
-            start_server(req_tx, addr).await;
+            start_server(req_tx, addr, tls, cert_path, private_path).await.unwrap();
         });
         while let Ok(areq) = req_rx.recv().await {
             let send = SendMethod { tx: areq.send };

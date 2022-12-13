@@ -38,4 +38,4 @@ def update_item(item_id: int, item: Item):
 if __name__ == '__main__':
     import rusticorn
 
-    rusticorn.run(app, "0.0.0.0:8000")
+    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key-pkcs1.pem")
