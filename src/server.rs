@@ -4,6 +4,7 @@ use crate::protocol::http::ReceiveTypes;
 use crate::protocol::http::SendStart;
 use crate::protocol::http::SendTypes;
 use core::task::{Context, Poll};
+use futures::channel::mpsc;
 use futures_util::ready;
 use hyper::body::HttpBody;
 use hyper::server::accept::Accept;
@@ -51,10 +52,13 @@ async fn call(
     addr: SocketAddr,
     req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    let mut response = Response::default();
-    let mut buf: Vec<u8> = vec![];
+    let (body_tx, body_rx) = mpsc::unbounded::<Result<Vec<u8>>>();
     let (send_tx, send_rx) = unbounded::<SendTypes>();
     let (recv_tx, recv_rx) = unbounded::<AsyncSender<ReceiveTypes>>();
+
+    let mut response = Response::builder()
+        .body(Body::wrap_stream(body_rx))
+        .unwrap();
 
     let scope = Python::with_gil(|py| configure_scope(py, &req, addr).unwrap().to_object(py));
     req_tx
@@ -89,22 +93,17 @@ async fn call(
                     }
                 }
             } else {
-                debug!("end request body");
                 break;
             }
         }
     });
 
     while let Ok(_type) = send_rx.recv().await {
-        debug!("{:?}", _type);
-
         let result = match _type {
             SendTypes::HttpResponseStart(send_start) => response_start(&mut response, send_start),
-            SendTypes::HttpResponseBody(mut send_body) => {
-                buf.append(&mut send_body.body);
+            SendTypes::HttpResponseBody(send_body) => {
+                body_tx.unbounded_send(Ok(send_body.body)).unwrap();
                 if !send_body.more_body {
-                    debug!("End response body");
-                    *response.body_mut() = buf.into();
                     break;
                 }
                 Ok(())
@@ -127,6 +126,7 @@ pub async fn start_server(
     tls: bool,
     cert_path: Option<String>,
     private_path: Option<String>,
+    http_version: HttpVersion,
 ) -> Result<()> {
     let atx = Arc::new(tx);
 
@@ -156,7 +156,14 @@ pub async fn start_server(
             let service = service_fn(move |req| call(tx.clone(), addr, req));
             async move { Ok::<_, Infallible>(service) }
         });
-        let server = Server::builder(TlsAcceptor::new(tls_cfg, incoming)).serve(make_svc);
+        let server = Server::builder(TlsAcceptor::new(tls_cfg, incoming));
+
+        let server = match http_version {
+            HttpVersion::HTTP1 => server.http1_only(true),
+            HttpVersion::HTTP2 => server.http2_only(true),
+            HttpVersion::ANY => server,
+        };
+        let server = server.serve(make_svc);
 
         server.await?;
     } else {
@@ -166,7 +173,14 @@ pub async fn start_server(
             let service = service_fn(move |req| call(tx.clone(), addr, req));
             async move { Ok::<_, Infallible>(service) }
         });
-        let server = Server::bind(&addr).serve(make_svc);
+        let server = Server::bind(&addr);
+
+        let server = match http_version {
+            HttpVersion::HTTP1 => server.http1_only(true),
+            HttpVersion::HTTP2 => server.http2_only(true),
+            HttpVersion::ANY => server,
+        };
+        let server = server.serve(make_svc);
 
         server.await?;
     }

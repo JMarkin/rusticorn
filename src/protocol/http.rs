@@ -30,13 +30,11 @@ impl Receive {
             if let Ok(val) = result {
                 _type = val;
             } else {
-                debug!("Body not exists but `receive` called");
                 _type = ReceiveTypes::HttpRequst(ReceiveRequest {
                     body: vec![],
                     more_body: false,
                 });
             }
-            debug!("{:?}", _type);
             let _d = Python::with_gil(|py| {
                 let dict = PyDict::new(py);
                 match _type {

@@ -3,7 +3,7 @@ import asyncio
 from .rusticorn import *
 
 
-def run(app, bind: str = "127.0.0.1:8000", tls: bool = False, cert_path: str = None, private_path: str = None):
+def run(app, bind: str = "127.0.0.1:8000", tls: bool = False, cert_path: str = None, private_path: str = None,):
 
     async def main():
         import rusticorn
