@@ -47,5 +47,6 @@ pub fn configure_scope<'a>(
     dict.set_item("raw_path", raw_path.into_py(py))?;
     dict.set_item("query_string", query_string.as_bytes().into_py(py))?;
 
+    debug!("scope {dict}");
     Ok(dict)
 }

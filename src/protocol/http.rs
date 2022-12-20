@@ -14,17 +14,16 @@ pub enum ReceiveTypes {
 
 #[pyclass]
 pub struct Receive {
-    pub tx: AsyncSender<AsyncSender<ReceiveTypes>>,
+    pub tx: UnboundedSender<AsyncSender<ReceiveTypes>>,
 }
 
 #[pymethods]
 impl Receive {
     fn __call__<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        let _tx = self.tx.clone();
+        let (tx, rx) = unbounded::<ReceiveTypes>();
+        self.tx.send(tx).unwrap();
 
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let (tx, rx) = unbounded::<ReceiveTypes>();
-            _tx.send(tx).await.unwrap();
             let result = rx.recv().await;
             let _type: ReceiveTypes;
             if let Ok(val) = result {
@@ -79,7 +78,7 @@ pub enum SendTypes {
 
 #[pyclass]
 pub struct SendMethod {
-    pub tx: AsyncSender<SendTypes>,
+    pub tx: UnboundedSender<SendTypes>,
 }
 
 fn bool_from_scope(scope: &PyDict, name: &str) -> bool {
@@ -97,49 +96,35 @@ fn bool_from_scope(scope: &PyDict, name: &str) -> bool {
 impl SendMethod {
     fn __call__<'a>(&self, py: Python<'a>, scope: &'a PyDict) -> PyResult<&'a PyAny> {
         let _type = scope.get_item("type").unwrap().to_string();
-        let tx = self.tx.clone();
-        match _type.as_str() {
+        let result = match _type.as_str() {
             "http.response.start" => {
                 let status: u16 = scope.get_item("status").unwrap().extract::<u16>()?;
                 let headers: Headers = scope.get_item("headers").unwrap().extract::<Headers>()?;
                 let trailers = bool_from_scope(scope, "trailers");
-                pyo3_asyncio::tokio::future_into_py(py, async move {
-                    let result = tx
-                        .send(SendTypes::HttpResponseStart(SendStart {
-                            status,
-                            headers,
-                            trailers,
-                        }))
-                        .await;
-
-                    match result {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            error!("{}", e.to_string());
-                            Ok(())
-                        }
-                    }
-                })
+                self.tx.send(SendTypes::HttpResponseStart(SendStart {
+                    status,
+                    headers,
+                    trailers,
+                }))
             }
             "http.response.body" => {
                 let body: Vec<u8> = scope.get_item("body").unwrap().extract::<Vec<u8>>()?;
                 let more_body = bool_from_scope(scope, "more_body");
 
-                pyo3_asyncio::tokio::future_into_py(py, async move {
-                    let result = tx
-                        .send(SendTypes::HttpResponseBody(SendBody { body, more_body }))
-                        .await;
-
-                    match result {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            error!("{}", e.to_string());
-                            Ok(())
-                        }
-                    }
-                })
+                self.tx
+                    .send(SendTypes::HttpResponseBody(SendBody { body, more_body }))
             }
             _ => panic!("unknown type {}", _type),
-        }
+        };
+
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            match result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!("{}", e.to_string());
+                    Ok(())
+                }
+            }
+        })
     }
 }
