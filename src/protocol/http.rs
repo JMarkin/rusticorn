@@ -14,17 +14,19 @@ pub enum ReceiveTypes {
 
 #[pyclass]
 pub struct Receive {
-    pub tx: UnboundedSender<AsyncSender<ReceiveTypes>>,
+    pub tx: UnboundedSender<Sender<ReceiveTypes>>,
 }
 
 #[pymethods]
 impl Receive {
     fn __call__<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        let (tx, rx) = unbounded::<ReceiveTypes>();
-        self.tx.send(tx).unwrap();
+        let _tx = self.tx.clone();
 
+        // TODO: change to AwaitableObj
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let result = rx.recv().await;
+            let (tx, rx) = channel::<ReceiveTypes>();
+            _tx.send(tx).unwrap();
+            let result = rx.await;
             let _type: ReceiveTypes;
             if let Ok(val) = result {
                 _type = val;
@@ -94,7 +96,7 @@ fn bool_from_scope(scope: &PyDict, name: &str) -> bool {
 
 #[pymethods]
 impl SendMethod {
-    fn __call__<'a>(&self, py: Python<'a>, scope: &'a PyDict) -> PyResult<&'a PyAny> {
+    fn __call__(&self, scope: &PyDict) -> PyResult<AwaitableObj> {
         let _type = scope.get_item("type").unwrap().to_string();
         let result = match _type.as_str() {
             "http.response.start" => {
@@ -117,14 +119,12 @@ impl SendMethod {
             _ => panic!("unknown type {}", _type),
         };
 
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            match result {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    error!("{}", e.to_string());
-                    Ok(())
-                }
+        match result {
+            Ok(_) => Ok(AwaitableObj { data: None }),
+            Err(e) => {
+                error!("{}", e.to_string());
+                Ok(AwaitableObj { data: None })
             }
-        })
+        }
     }
 }

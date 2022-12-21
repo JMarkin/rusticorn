@@ -5,6 +5,7 @@ mod protocol;
 mod scope;
 mod server;
 mod service;
+mod py;
 use crate::prelude::*;
 use server::start_server;
 

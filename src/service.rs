@@ -61,7 +61,7 @@ impl Service<Request<Body>> for Svc {
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let (body_tx, body_rx) = mpsc::unbounded::<Result<Vec<u8>>>();
         let (send_tx, mut send_rx) = unbounded_channel::<SendTypes>();
-        let (recv_tx, mut recv_rx) = unbounded_channel::<AsyncSender<ReceiveTypes>>();
+        let (recv_tx, mut recv_rx) = unbounded_channel::<Sender<ReceiveTypes>>();
         let send = SendMethod { tx: send_tx };
         let receive = Receive { tx: recv_tx };
 
@@ -86,7 +86,7 @@ impl Service<Request<Body>> for Svc {
                     match chunk {
                         Err(e) => {
                             warn!("{}", e.to_string());
-                            tx.send(ReceiveTypes::HttpDisconect).await.unwrap();
+                            tx.send(ReceiveTypes::HttpDisconect).unwrap();
                             break;
                         }
                         Ok(data) => {
@@ -95,7 +95,6 @@ impl Service<Request<Body>> for Svc {
                                 body: data.into(),
                                 more_body,
                             }))
-                            .await
                             .unwrap();
                         }
                     }
