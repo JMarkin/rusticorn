@@ -1,16 +1,21 @@
 use crate::prelude::*;
-use hyper::{Body, Request, Version};
+use hyper::{
+    header::{HOST, SEC_WEBSOCKET_PROTOCOL},
+    Body, Request, Version,
+};
 use log::debug;
 use std::collections::HashMap;
 use urlencoding::decode;
 
 pub fn configure_scope<'a>(
+    _type: ScopeType,
     py: Python<'a>,
     req: &Request<Body>,
     addr: SocketAddr,
 ) -> PyResult<&'a PyDict> {
     let mut scope: HashMap<&str, &str> = HashMap::from([
-        ("type", "http"),
+        ("version", "3.0"),
+        ("spec_version", "2.3"),
         (
             "http_version",
             match req.version() {
@@ -22,7 +27,9 @@ pub fn configure_scope<'a>(
         ),
     ]);
     let method = req.method().as_str().to_uppercase();
-    scope.insert("method", &method);
+    if _type == ScopeType::Http {
+        scope.insert("method", &method);
+    }
     scope.insert("scheme", req.uri().scheme_str().unwrap_or("http"));
     scope.insert("root_path", "");
     let path: String = decode(req.uri().path()).expect("UTF-8").into();
@@ -35,17 +42,35 @@ pub fn configure_scope<'a>(
 
     let mut headers = vec![];
 
+    if let Some(auth) = req.uri().authority() {
+        headers.push((HOST.as_str().as_bytes(), auth.as_str().as_bytes()));
+    }
+
     for (key, val) in req.headers().iter() {
+        if _type == ScopeType::Ws && key == SEC_WEBSOCKET_PROTOCOL {
+            continue;
+        }
         headers.push((key.as_str().as_bytes(), val.as_bytes()));
     }
 
     let dict = scope.into_py_dict(py);
+
+    if _type == ScopeType::Ws {
+        let mut subprotocols = vec![];
+        for val in req.headers().get_all(SEC_WEBSOCKET_PROTOCOL) {
+            for protocols in val.to_str().unwrap().to_string().split(',') {
+                subprotocols.push(protocols);
+            }
+        }
+        dict.set_item("subprotocols", subprotocols.into_py(py))?;
+    }
 
     dict.set_item("headers", headers.into_py(py))?;
     dict.set_item("client", (client.0.into_py(py), client.1.into_py(py)))?;
     dict.set_item("path", path.into_py(py))?;
     dict.set_item("raw_path", raw_path.into_py(py))?;
     dict.set_item("query_string", query_string.as_bytes().into_py(py))?;
+    dict.set_item("type", _type.into_py(py))?;
 
     debug!("scope {dict}");
     Ok(dict)

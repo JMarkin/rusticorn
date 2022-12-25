@@ -2,9 +2,9 @@ use pyo3::pyclass::IterNextOutput;
 
 use crate::prelude::*;
 #[pyclass]
-pub struct AwaitableObj {
-    data: Option<PyObject>,
-}
+#[derive(Default)]
+pub struct AwaitableObj {}
+
 #[pymethods]
 impl AwaitableObj {
     fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
@@ -16,6 +16,6 @@ impl AwaitableObj {
     }
 
     fn __next__(slf: PyRefMut<'_, Self>) -> IterNextOutput<Option<PyObject>, Option<PyObject>> {
-        IterNextOutput::Return(slf.data.clone())
+        IterNextOutput::Return(None)
     }
 }

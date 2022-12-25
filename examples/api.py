@@ -1,11 +1,10 @@
-from typing import Union
+import asyncio
+import logging
 import os
+from typing import Union
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-
-import asyncio
-import logging
 
 FORMAT = '%(message)s'
 logging.basicConfig(format=FORMAT)
@@ -38,4 +37,4 @@ def update_item(item_id: int, item: Item):
 if __name__ == '__main__':
     import rusticorn
 
-    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key-pkcs1.pem")
+    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key.pem")

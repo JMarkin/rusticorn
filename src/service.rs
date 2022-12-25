@@ -1,34 +1,24 @@
 use std::{
-    fs, io,
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
-use futures::{channel::mpsc, Future};
+use futures::Future;
 use futures_util::ready;
 use hyper::{
-    body::HttpBody,
     server::{
         accept::Accept,
         conn::{AddrIncoming, AddrStream},
     },
     service::Service,
-    Body, Request, Response, StatusCode,
+    Body, Request, Response,
 };
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    prelude::*,
-    protocol::http::{Receive, SendMethod},
-    scope::configure_scope,
-};
-
-use crate::protocol::http::ReceiveRequest;
-use crate::protocol::http::ReceiveTypes;
-use crate::protocol::http::SendStart;
-use crate::protocol::http::SendTypes;
+use crate::prelude::*;
 
 pub struct Svc {
     app: PyObject,
@@ -36,100 +26,26 @@ pub struct Svc {
     addr: SocketAddr,
 }
 
-fn response_start<T>(resp: &mut Response<T>, send_start: SendStart) -> Result<()> {
-    *resp.status_mut() = StatusCode::from_u16(send_start.status).unwrap();
-    for header in send_start.headers {
-        let name = header.first().unwrap();
-        let value = header.last().unwrap();
-        let name = hyper::http::header::HeaderName::from_bytes(name.as_slice())?;
-        let value = hyper::http::header::HeaderValue::from_bytes(value.as_slice())?;
-
-        resp.headers_mut().insert(name, value);
-    }
-    Ok(())
-}
-
 impl Service<Request<Body>> for Svc {
     type Response = Response<Body>;
     type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = FutureResponse;
 
     fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let (body_tx, body_rx) = mpsc::unbounded::<Result<Vec<u8>>>();
-        let (send_tx, mut send_rx) = unbounded_channel::<SendTypes>();
-        let (recv_tx, mut recv_rx) = unbounded_channel::<Sender<ReceiveTypes>>();
-        let send = SendMethod { tx: send_tx };
-        let receive = Receive { tx: recv_tx };
+        if hyper_tungstenite::is_upgrade_request(&req) {
+            return crate::protocol::ws::handle(
+                self.app.clone(),
+                self.locals.clone(),
+                self.addr,
+                req,
+            );
+        }
 
-        let scope =
-            Python::with_gil(|py| configure_scope(py, &req, self.addr).unwrap().to_object(py));
-        let mut response = Response::builder()
-            .body(Body::wrap_stream(body_rx))
-            .unwrap();
-        let fut = Python::with_gil(|py| {
-            let args = (scope, receive.into_py(py), send.into_py(py));
-            let coro = self.app.call1(py, args).unwrap();
-            pyo3_asyncio::into_future_with_locals(&self.locals, coro.as_ref(py))
-        })
-        .unwrap();
-
-        let wait_parse_request = tokio::spawn(async move {
-            let mut chunk_stream = req.into_body();
-
-            while let Some(tx) = recv_rx.recv().await {
-                let chunk = chunk_stream.data().await;
-                if let Some(chunk) = chunk {
-                    match chunk {
-                        Err(e) => {
-                            warn!("{}", e.to_string());
-                            tx.send(ReceiveTypes::HttpDisconect).unwrap();
-                            break;
-                        }
-                        Ok(data) => {
-                            let more_body = !chunk_stream.is_end_stream();
-                            tx.send(ReceiveTypes::HttpRequst(ReceiveRequest {
-                                body: data.into(),
-                                more_body,
-                            }))
-                            .unwrap();
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-        let call_app = tokio::spawn(fut);
-
-        Box::pin(async move {
-            while let Some(_type) = send_rx.recv().await {
-                let result = match _type {
-                    SendTypes::HttpResponseStart(send_start) => {
-                        response_start(&mut response, send_start)
-                    }
-                    SendTypes::HttpResponseBody(send_body) => {
-                        body_tx.unbounded_send(Ok(send_body.body)).unwrap();
-                        if !send_body.more_body {
-                            break;
-                        }
-                        Ok(())
-                    }
-                };
-
-                if let Err(e) = result {
-                    response = HttpError::internal_error(e);
-                    break;
-                }
-            }
-
-            wait_parse_request.abort();
-            call_app.abort();
-            Ok(response)
-        })
+        crate::protocol::http::handle(self.app.clone(), self.locals.clone(), self.addr, req)
     }
 }
 
@@ -325,41 +241,4 @@ impl Accept for Acceptor {
             None => Poll::Ready(None),
         }
     }
-}
-
-// Load public certificate from file.
-pub fn load_certs(filename: &str) -> io::Result<Vec<rustls::Certificate>> {
-    // Open certificate file.
-    let certfile = fs::File::open(filename).map_err(|e| {
-        let err = format!("failed to open {}: {}", filename, e);
-        io::Error::new(io::ErrorKind::Other, err)
-    })?;
-    let mut reader = io::BufReader::new(certfile);
-
-    // Load and return certificate.
-    let certs = rustls_pemfile::certs(&mut reader)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to load certificate"))?;
-    Ok(certs.into_iter().map(rustls::Certificate).collect())
-}
-
-// Load private key from file.
-pub fn load_private_key(filename: &str) -> io::Result<rustls::PrivateKey> {
-    // Open keyfile.
-    let keyfile = fs::File::open(filename).map_err(|e| {
-        let err = format!("failed to open {}: {}", filename, e);
-        io::Error::new(io::ErrorKind::Other, err)
-    })?;
-    let mut reader = io::BufReader::new(keyfile);
-
-    // Load and return a single private key.
-    let keys = rustls_pemfile::rsa_private_keys(&mut reader)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to load private key"))?;
-    if keys.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "expected a single private key",
-        ));
-    }
-
-    Ok(rustls::PrivateKey(keys[0].clone()))
 }
