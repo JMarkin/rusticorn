@@ -13,8 +13,11 @@ pub use pyo3::types::*;
 pub use pyo3_asyncio::TaskLocals;
 pub use std::net::SocketAddr;
 pub use std::pin::Pin;
-pub use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-pub use tokio::sync::oneshot::{channel, Sender};
+pub use tokio::sync::mpsc::{
+    channel as bounded_channel, unbounded_channel, Receiver as BoundedReceiver,
+    Sender as BoundedSender, UnboundedReceiver, UnboundedSender,
+};
+pub use tokio::sync::oneshot::{channel, Receiver, Sender};
 pub type FutureResponse =
     Pin<Box<dyn Future<Output = Result<Response<Body>, hyper::Error>> + Send>>;
 pub type Headers = Vec<Vec<Vec<u8>>>;

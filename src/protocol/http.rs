@@ -4,6 +4,8 @@ use hyper::{body::HttpBody, Request, StatusCode};
 
 use crate::{configure_scope, prelude::*};
 
+use super::common::insert_headers;
+
 #[derive(Debug, Clone)]
 pub struct ReceiveRequest {
     pub body: Vec<u8>,
@@ -17,12 +19,12 @@ pub enum ReceiveTypes {
 }
 
 #[pyclass]
-pub struct Receive {
+pub struct ReceiveFunc {
     pub tx: UnboundedSender<Sender<ReceiveTypes>>,
 }
 
 #[pymethods]
-impl Receive {
+impl ReceiveFunc {
     fn __call__<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
         let _tx = self.tx.clone();
 
@@ -81,7 +83,7 @@ pub enum SendTypes {
 }
 
 #[pyclass]
-pub struct SendMethod {
+pub struct SendFunc {
     pub tx: UnboundedSender<SendTypes>,
 }
 
@@ -97,7 +99,7 @@ fn bool_from_scope(scope: &PyDict, name: &str) -> bool {
 }
 
 #[pymethods]
-impl SendMethod {
+impl SendFunc {
     fn __call__(&self, scope: &PyDict) -> PyResult<AwaitableObj> {
         let _type = scope.get_item("type").unwrap().to_string();
         let result = match _type.as_str() {
@@ -131,19 +133,6 @@ impl SendMethod {
     }
 }
 
-fn response_start<T>(resp: &mut Response<T>, send_start: SendStart) -> Result<()> {
-    *resp.status_mut() = StatusCode::from_u16(send_start.status).unwrap();
-    for header in send_start.headers {
-        let name = header.first().unwrap();
-        let value = header.last().unwrap();
-        let name = hyper::http::header::HeaderName::from_bytes(name.as_slice())?;
-        let value = hyper::http::header::HeaderValue::from_bytes(value.as_slice())?;
-
-        resp.headers_mut().insert(name, value);
-    }
-    Ok(())
-}
-
 pub fn handle(
     app: PyObject,
     locals: TaskLocals,
@@ -153,8 +142,8 @@ pub fn handle(
     let (body_tx, body_rx) = mpsc::unbounded::<Result<Vec<u8>>>();
     let (send_tx, mut send_rx) = unbounded_channel::<SendTypes>();
     let (recv_tx, mut recv_rx) = unbounded_channel::<Sender<ReceiveTypes>>();
-    let send = SendMethod { tx: send_tx };
-    let receive = Receive { tx: recv_tx };
+    let send = SendFunc { tx: send_tx };
+    let receive = ReceiveFunc { tx: recv_tx };
 
     let scope = Python::with_gil(|py| {
         configure_scope(ScopeType::Http, py, &req, addr)
@@ -203,7 +192,8 @@ pub fn handle(
         while let Some(_type) = send_rx.recv().await {
             let result = match _type {
                 SendTypes::HttpResponseStart(send_start) => {
-                    response_start(&mut response, send_start)
+                    *response.status_mut() = StatusCode::from_u16(send_start.status).unwrap();
+                    insert_headers(&mut response, send_start.headers)
                 }
                 SendTypes::HttpResponseBody(send_body) => {
                     body_tx.unbounded_send(Ok(send_body.body)).unwrap();

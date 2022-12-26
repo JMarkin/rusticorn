@@ -30,6 +30,8 @@ pub fn configure_scope<'a>(
     if _type == ScopeType::Http {
         scope.insert("method", &method);
     }
+
+    debug!("{:?}", req.uri());
     scope.insert("scheme", req.uri().scheme_str().unwrap_or("http"));
     scope.insert("root_path", "");
     let path: String = decode(req.uri().path()).expect("UTF-8").into();
@@ -58,9 +60,8 @@ pub fn configure_scope<'a>(
     if _type == ScopeType::Ws {
         let mut subprotocols = vec![];
         for val in req.headers().get_all(SEC_WEBSOCKET_PROTOCOL) {
-            for protocols in val.to_str().unwrap().to_string().split(',') {
-                subprotocols.push(protocols);
-            }
+            let mut s = val.to_str().unwrap().split(',').collect::<Vec<&str>>();
+            subprotocols.append(&mut s);
         }
         dict.set_item("subprotocols", subprotocols.into_py(py))?;
     }

@@ -24,4 +24,5 @@ dev = [
     "yapf>=0.32.0",
     "patchelf>=0.17.0.0",
     "hypercorn>=0.14.3",
+    "websockets>=10.4",
 ]
