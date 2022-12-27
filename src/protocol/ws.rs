@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
-use crate::{configure_scope, prelude::*};
+use crate::{configure_scope, prelude::*, server_header};
 use anyhow::Error;
-use futures::{sink::SinkExt, stream::FusedStream, StreamExt};
+use futures::{
+    sink::SinkExt,
+    stream::{FusedStream, SplitSink, SplitStream},
+    StreamExt,
+};
 use hyper::{Request, StatusCode};
-use hyper_tungstenite::tungstenite::{
-    protocol::{frame::coding::CloseCode, CloseFrame},
-    Message,
+use hyper_tungstenite::{
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    },
+    WebSocketStream,
 };
 use tokio::sync::Mutex;
 
@@ -21,26 +28,18 @@ pub enum ReceiveType {
 
 #[pyclass]
 pub struct ReceiveFunc {
-    pub tx: UnboundedSender<Sender<ReceiveType>>,
+    pub rx: AsyncReceiver<ReceiveType>,
 }
 
 #[pymethods]
 impl ReceiveFunc {
     fn __call__<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        let _tx = self.tx.clone();
+        let _rx = self.rx.clone();
 
         // TODO: change to AwaitableObj
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let (tx, rx) = channel::<ReceiveType>();
-            _tx.send(tx).unwrap();
+            let _type = _rx.recv().await.unwrap();
 
-            let result = rx.await;
-            let _type: ReceiveType;
-            if let Ok(val) = result {
-                _type = val;
-            } else {
-                _type = ReceiveType::Disconnect(1005);
-            }
             let _d = Python::with_gil(|py| -> PyResult<PyObject> {
                 let dict = PyDict::new(py);
                 match _type {
@@ -58,10 +57,11 @@ impl ReceiveFunc {
                         }
 
                         if message.is_binary() {
-                            dict.set_item("bytes", message.into_data())?;
+                            dict.set_item("bytes", PyBytes::new(py, message.into_data().as_ref()))?;
                         }
                     }
                 };
+
                 Ok(dict.to_object(py))
             })?;
             debug!("receive {}", _d);
@@ -92,26 +92,28 @@ impl SendFunc {
                 let subprotocol = scope.get_item("subprotocol");
                 let mut headers = scope.get_item("headers").unwrap().extract::<Headers>()?;
 
-                if let Some(subprotocol) = subprotocol {
-                    let subprotocol = subprotocol.extract::<String>()?;
-                    headers.push(vec![b"sec-websocket-protocol".to_vec(), subprotocol.into()]);
+                if subprotocol.is_some() {
+                    let subprotocol = subprotocol.unwrap();
+
+                    if !subprotocol.is_none() {
+                        let subprotocol = subprotocol.extract::<String>().unwrap();
+                        headers.push(vec![b"sec-websocket-protocol".to_vec(), subprotocol.into()]);
+                    }
                 }
 
-                debug!("sended0");
                 self.tx.send(SendType::Accept(headers)).unwrap();
-                debug!("sended");
                 Ok(())
             }
             "websocket.close" => {
                 let mut code = 1000;
                 let code_none = scope.get_item("code");
                 if let Some(_code) = code_none {
-                    code = _code.extract::<u16>()?;
+                    code = _code.extract::<u16>().unwrap_or(1000);
                 }
                 let mut reason = "".to_string();
                 let reason_none = scope.get_item("reason");
                 if let Some(_reason) = reason_none {
-                    reason = _reason.extract::<String>()?;
+                    reason = _reason.extract::<String>().unwrap_or("".to_string());
                 }
                 self.tx.send(SendType::Close((code, reason))).unwrap();
                 Ok(())
@@ -149,45 +151,60 @@ impl SendFunc {
     }
 }
 
-async fn serve_ws(
-    ws: HyperWebsocket,
-    mut send_rx: UnboundedReceiver<SendType>,
-    mut recv_rx: UnboundedReceiver<Sender<ReceiveType>>,
-) -> Result<()> {
-    let websocket = ws.await?;
-    let (mut tx, mut rx) = websocket.split();
+enum ClosedReason {
+    Client,
+    Server,
+}
 
-    let recv_fut = tokio::spawn(async move {
-        while let Some(recv) = recv_rx.recv().await {
-            debug!("serve recv {:?}", recv);
-            if let Some(message) = rx.next().await {
-                match message.unwrap() {
-                    Message::Text(msg) => {
-                        recv.send(ReceiveType::Receive(Message::Text(msg))).unwrap();
-                    }
-                    Message::Binary(msg) => {
-                        recv.send(ReceiveType::Receive(Message::Binary(msg)))
-                            .unwrap();
-                    }
-                    Message::Close(msg) => {
-                        if let Some(msg) = &msg {
-                            recv.send(ReceiveType::Disconnect(u16::from(msg.code)))
-                                .unwrap();
-                        } else {
-                            recv.send(ReceiveType::Disconnect(1005)).unwrap();
-                        }
-                        break;
-                    }
-                    _ => {
-                        unimplemented!();
-                    }
-                }
+async fn receive_loop(
+    recv_tx: AsyncSender<ReceiveType>,
+    mut rx: SplitStream<WebSocketStream<hyper::upgrade::Upgraded>>,
+    tx: UnboundedSender<Message>,
+) -> Result<ClosedReason> {
+    while let Some(message) = rx.next().await {
+        match message? {
+            Message::Text(msg) => {
+                recv_tx
+                    .send(ReceiveType::Receive(Message::Text(msg)))
+                    .await
+                    .unwrap();
             }
+            Message::Binary(msg) => {
+                recv_tx
+                    .send(ReceiveType::Receive(Message::Binary(msg)))
+                    .await
+                    .unwrap();
+            }
+            Message::Close(msg) => {
+                if let Some(msg) = &msg {
+                    recv_tx
+                        .send(ReceiveType::Disconnect(u16::from(msg.code)))
+                        .await
+                        .unwrap();
+                } else {
+                    recv_tx.send(ReceiveType::Disconnect(1005)).await.unwrap();
+                }
+                return Ok(ClosedReason::Client);
+            }
+            Message::Ping(msg) => {
+                tx.send(Message::Pong(msg)).unwrap();
+            }
+            _ => {}
         }
-    });
+    }
+    Ok(ClosedReason::Server)
+}
 
-    let send_fut = tokio::spawn(async move {
-        while let Some(_type) = send_rx.recv().await {
+async fn send_loop(
+    mut send_rx: UnboundedReceiver<SendType>,
+    tx: UnboundedSender<Message>,
+) -> Result<ClosedReason> {
+    loop {
+        let connected = tx.send(Message::Ping(vec![]));
+        if let Err(_e) = connected {
+            break;
+        }
+        if let Ok(_type) = send_rx.try_recv() {
             debug!("serve send {:?}", _type);
             match _type {
                 SendType::Close((code, reason)) => {
@@ -195,12 +212,38 @@ async fn serve_ws(
                         code: CloseCode::from(code),
                         reason: reason.into(),
                     })))
-                    .await
                     .unwrap();
-                    break;
+                    return Ok(ClosedReason::Server);
                 }
-                SendType::Send(msg) => tx.send(msg).await.unwrap(),
+                SendType::Send(msg) => tx.send(msg).unwrap(),
                 _ => error!("Accept again not working"),
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+    }
+    Ok(ClosedReason::Client)
+}
+
+async fn serve_ws(
+    ws: HyperWebsocket,
+    send_rx: UnboundedReceiver<SendType>,
+    recv_tx: AsyncSender<ReceiveType>,
+) -> Result<()> {
+    let websocket = ws.await?;
+    let (mut tx, rx) = websocket.split();
+    let (message_tx, mut message_rx) = unbounded_channel::<Message>();
+
+    let recv_fut = tokio::spawn(receive_loop(recv_tx, rx, message_tx.clone()));
+
+    let send_fut = tokio::spawn(send_loop(send_rx, message_tx.clone()));
+
+    let sender_fut = tokio::spawn(async move {
+        while let Some(msg) = message_rx.recv().await {
+            let connected = tx.send(msg).await;
+            if let Err(e) = connected {
+                info!("close websocket {}", e.to_string());
+                break;
             }
         }
     });
@@ -211,6 +254,9 @@ async fn serve_ws(
         }
         _val = send_fut => {
             info!("terminated by server");
+        }
+        _val = sender_fut => {
+            info!("terminated");
         }
     }
 
@@ -224,9 +270,9 @@ pub fn handle(
     mut req: Request<Body>,
 ) -> FutureResponse {
     let (send_tx, mut send_rx) = unbounded_channel::<SendType>();
-    let (recv_tx, mut recv_rx) = unbounded_channel::<Sender<ReceiveType>>();
+    let (recv_tx, mut recv_rx) = unbounded::<ReceiveType>();
     let send = SendFunc { tx: send_tx };
-    let receive = ReceiveFunc { tx: recv_tx };
+    let receive = ReceiveFunc { rx: recv_rx };
 
     let scope = Python::with_gil(|py| {
         configure_scope(ScopeType::Ws, py, &req, addr)
@@ -242,21 +288,18 @@ pub fn handle(
     let call_app = tokio::spawn(fut);
 
     Box::pin(async move {
-        let result = recv_rx.recv().await;
-        let recv_send = result.unwrap();
-        recv_send.send(ReceiveType::Connect).unwrap();
+        recv_tx.send(ReceiveType::Connect).await.unwrap();
         debug!("wait accept");
 
-        let result = send_rx.recv().await;
-        let accept_headers = result.unwrap();
+        let accept = send_rx.recv().await.unwrap();
 
-        let response = match accept_headers {
+        let mut response = match accept {
             SendType::Accept(headers) => {
                 debug!("accept {:?}", headers);
                 let (mut response, ws) = hyper_tungstenite::upgrade(&mut req, None).unwrap();
 
                 insert_headers(&mut response, headers).unwrap();
-                let serve_fut = serve_ws(ws, send_rx, recv_rx);
+                let serve_fut = serve_ws(ws, send_rx, recv_tx);
 
                 tokio::spawn(async move {
                     if let Err(e) = serve_fut.await {
@@ -272,6 +315,7 @@ pub fn handle(
                 r
             }
         };
+        (*response.headers_mut()).append("server", server_header!());
         Ok(response)
     })
 }

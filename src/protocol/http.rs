@@ -2,7 +2,7 @@ use futures::channel::mpsc;
 
 use hyper::{body::HttpBody, Request, StatusCode};
 
-use crate::{configure_scope, prelude::*};
+use crate::{configure_scope, prelude::*, server_header};
 
 use super::common::insert_headers;
 
@@ -212,6 +212,7 @@ pub fn handle(
 
         wait_parse_request.abort();
         call_app.abort();
+        (*response.headers_mut()).append("server", server_header!());
         Ok(response)
     })
 }

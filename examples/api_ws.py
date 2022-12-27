@@ -51,11 +51,11 @@ async def get():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    print(1)
+    print('scope', websocket)
     await websocket.accept()
     while True:
-        data = await websocket.receive_text()
-        await websocket.send_text(f"Message text was: {data}")
+        data = await websocket.receive()
+        await websocket.send_text(f"Message recv was: {data}")
 
 
 if __name__ == '__main__':

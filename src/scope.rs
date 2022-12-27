@@ -32,7 +32,11 @@ pub fn configure_scope<'a>(
     }
 
     debug!("{:?}", req.uri());
-    scope.insert("scheme", req.uri().scheme_str().unwrap_or("http"));
+    if _type == ScopeType::Http {
+        scope.insert("scheme", req.uri().scheme_str().unwrap_or("http"));
+    } else {
+        scope.insert("scheme", req.uri().scheme_str().unwrap_or("ws"));
+    }
     scope.insert("root_path", "");
     let path: String = decode(req.uri().path()).expect("UTF-8").into();
     let raw_path = req.uri().path().as_bytes();
