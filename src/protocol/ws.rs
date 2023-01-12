@@ -1,12 +1,6 @@
-use std::sync::Arc;
-
 use crate::{configure_scope, prelude::*, server_header};
 use anyhow::Error;
-use futures::{
-    sink::SinkExt,
-    stream::{FusedStream, SplitSink, SplitStream},
-    StreamExt,
-};
+use futures::{sink::SinkExt, stream::SplitStream, StreamExt};
 use hyper::{Request, StatusCode};
 use hyper_tungstenite::{
     tungstenite::{
@@ -15,7 +9,6 @@ use hyper_tungstenite::{
     },
     WebSocketStream,
 };
-use tokio::sync::Mutex;
 
 use super::common::insert_headers;
 
@@ -92,9 +85,7 @@ impl SendFunc {
                 let subprotocol = scope.get_item("subprotocol");
                 let mut headers = scope.get_item("headers").unwrap().extract::<Headers>()?;
 
-                if subprotocol.is_some() {
-                    let subprotocol = subprotocol.unwrap();
-
+                if let Some(subprotocol) = subprotocol {
                     if !subprotocol.is_none() {
                         let subprotocol = subprotocol.extract::<String>().unwrap();
                         headers.push(vec![b"sec-websocket-protocol".to_vec(), subprotocol.into()]);
@@ -113,7 +104,9 @@ impl SendFunc {
                 let mut reason = "".to_string();
                 let reason_none = scope.get_item("reason");
                 if let Some(_reason) = reason_none {
-                    reason = _reason.extract::<String>().unwrap_or("".to_string());
+                    reason = _reason
+                        .extract::<String>()
+                        .unwrap_or_else(|_| "".to_string());
                 }
                 self.tx.send(SendType::Close((code, reason))).unwrap();
                 Ok(())
@@ -263,14 +256,9 @@ async fn serve_ws(
     Ok(())
 }
 
-pub fn handle(
-    app: PyObject,
-    locals: TaskLocals,
-    addr: SocketAddr,
-    mut req: Request<Body>,
-) -> FutureResponse {
+pub fn handle(app: PyObject, addr: SocketAddr, mut req: Request<Body>) -> FutureResponse {
     let (send_tx, mut send_rx) = unbounded_channel::<SendType>();
-    let (recv_tx, mut recv_rx) = unbounded::<ReceiveType>();
+    let (recv_tx, recv_rx) = unbounded::<ReceiveType>();
     let send = SendFunc { tx: send_tx };
     let receive = ReceiveFunc { rx: recv_rx };
 
