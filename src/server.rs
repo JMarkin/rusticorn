@@ -1,12 +1,12 @@
+use crate::prelude::*;
 use hyper::server::conn::{http1, http2};
 use std::fs;
+use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
-use tokio::sync::Mutex;
-
-use crate::prelude::*;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
 use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
@@ -29,6 +29,7 @@ where
 struct Svc {
     addr: SocketAddr,
     tx: UnboundedSender<ScopeRecvSend>,
+    cfg: &'static Config,
 }
 
 impl Service<Request<IncomingBody>> for Svc {
@@ -37,21 +38,21 @@ impl Service<Request<IncomingBody>> for Svc {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&mut self, req: Request<IncomingBody>) -> Self::Future {
+        let cfg = self.cfg;
         let addr = self.addr;
         let tx = self.tx.clone();
 
-        crate::protocol::http::handle(addr, req, tx)
-        // if hyper_tungstenite::is_upgrade_request(&req) {
-        //     crate::protocol::ws::handle(app, addr, req)
-        // } else {
-        //     crate::protocol::http::handle(app, addr, req)
-        // }
+        if is_upgrade_request(&req) {
+            crate::protocol::ws::handle(cfg, addr, req, tx)
+        } else {
+            crate::protocol::http::handle(addr, req, tx)
+        }
     }
 }
 
 macro_rules! spawn_service {
     ($http_version:expr, $stream:expr, $service:expr) => {
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             if let Err(err) = match $http_version {
                 HttpVersion::HTTP1 => {
                     http1::Builder::new()
@@ -107,8 +108,10 @@ impl ASGIServer {
     }
 }
 
+const HTTP2_ALPN: [u8; 2] = [104, 50];
+
 pub async fn start_server(
-    cfg: Config,
+    cfg: &'static Config,
     tx: UnboundedSender<ScopeRecvSend>,
     stop_tx: Sender<bool>,
 ) -> Result<()> {
@@ -154,24 +157,37 @@ pub async fn start_server(
 
     let (shutdown_send, mut shutdown_recv) = tokio::sync::mpsc::channel::<bool>(1);
 
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         loop {
             let (stream, peer_addr) = listener.accept().await.expect("can't listen");
 
             let service = Svc {
                 addr: peer_addr,
                 tx: tx.clone(),
+                cfg: &cfg,
             };
 
             if cfg.tls.is_some() {
                 let acceptor = acceptor.clone();
-                let stream = acceptor
-                    .unwrap()
-                    .accept(stream)
-                    .await
-                    .expect("can't tls accept");
+                let stream = acceptor.unwrap().accept(stream).await;
+                if stream.is_err() {
+                    error!("can't tls accept: {:?}", stream);
+                    continue;
+                }
+                let stream = stream.unwrap();
 
-                spawn_service!(cfg.http_version, stream, service);
+                let alpn = stream.get_ref().1.deref().alpn_protocol();
+
+                if alpn.is_none() {
+                    error!("alpn proto empty");
+                    continue;
+                }
+
+                if alpn.unwrap() == HTTP2_ALPN {
+                    spawn_service!(HttpVersion::HTTP2, stream, service);
+                } else {
+                    spawn_service!(HttpVersion::HTTP1, stream, service);
+                }
             } else {
                 spawn_service!(cfg.http_version, stream, service);
             }

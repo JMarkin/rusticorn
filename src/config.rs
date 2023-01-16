@@ -14,10 +14,9 @@ fn default_ping_timeout() -> f32 {
     20.0
 }
 
-#[pyclass]
-#[derive(Deserialize, Clone)]
+#[pyclass(module = "rusticorn")]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub application: String,
     #[serde(default = "default_bind")]
     pub bind: String,
     #[serde(default)]
@@ -31,13 +30,13 @@ pub struct Config {
     pub ws: WebSocket,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Tls {
     pub cert_path: String,
     pub private_path: String,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Limit {
     #[serde(default)]
     pub concurrency: Option<u32>,
@@ -45,7 +44,7 @@ pub struct Limit {
     pub python_execution: Option<u32>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct WebSocket {
     #[serde(default = "default_ping_interval")]
     pub ping_interval: f32,
@@ -57,7 +56,6 @@ pub struct WebSocket {
 impl Config {
     #[new]
     fn new(
-        application: String,
         bind: String,
         http_version: Option<String>,
         cert_path: Option<String>,
@@ -85,7 +83,6 @@ impl Config {
         };
 
         Self {
-            application,
             bind,
             http_version,
             tls,

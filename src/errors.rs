@@ -15,4 +15,15 @@ impl HttpError {
         (*response.headers_mut()).append("server", server_header!());
         response
     }
+
+    pub fn forbidden(msg: &str) -> Response<HttpBody<Bytes>> {
+        error!("{}", msg);
+        let mut response = Response::builder()
+            .status(hyper::StatusCode::FORBIDDEN)
+            .body("Forbidden".into())
+            .unwrap();
+        (*response.headers_mut()).append("server", server_header!());
+        response
+
+    }
 }

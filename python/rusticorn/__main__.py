@@ -24,8 +24,7 @@ def run(application,
         private_path=None,
         limit_concurrency=None,
         limit_python_execution=None,
-        ws_ping_interval=20.0,
-        ws_ping_timeout=20.0):
+        ws_ping_interval=20.0):
     module, app = application.split(':')
     app = getattr(importlib.import_module(module), app, None)
     if app is None:

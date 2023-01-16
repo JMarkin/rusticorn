@@ -23,7 +23,7 @@ struct Receiver {
 #[pymethods]
 impl Receiver {
     fn __call__(&self) -> PyAsync<Result<PyObject>> {
-        debug!("recv called");
+        debug!("http: recv called");
         let _body = self.body.clone();
         async move {
             let body = _body.lock().await.frame().await;
@@ -175,12 +175,8 @@ pub fn handle(
         body: Arc::new(Mutex::new(req_body)),
     };
 
-    let scope = Scope {
-        req: parts,
-        addr,
-        _type: ScopeType::Http,
-        _dict: Python::with_gil(|py| PyDict::new(py).into()),
-    };
+    let scope = Scope::new(parts, addr, ScopeType::Http);
+    debug!("{:?}", scope);
 
     let args = Python::with_gil(|py| (scope.into_py(py), receiver.into_py(py), sender.into_py(py)));
 

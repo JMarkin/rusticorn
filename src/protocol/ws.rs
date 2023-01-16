@@ -1,101 +1,201 @@
-use crate::{configure_scope, prelude::*, server_header};
+use std::{
+    cell::RefCell,
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
+
+use crate::{prelude::*, server_header};
 use anyhow::Error;
-use futures::{sink::SinkExt, stream::SplitStream, StreamExt};
+use futures::{stream::SplitStream, SinkExt, StreamExt};
 use hyper::{Request, StatusCode};
-use hyper_tungstenite::{
-    tungstenite::{
-        protocol::{frame::coding::CloseCode, CloseFrame},
-        Message,
-    },
-    WebSocketStream,
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    Mutex,
+};
+use tungstenite::{
+    protocol::{frame::coding::CloseCode, CloseFrame},
+    Message,
 };
 
 use super::common::insert_headers;
 
-#[derive(Debug, Clone)]
-pub enum ReceiveType {
-    Disconnect(u16),
-    Receive(Message),
+const DISCONENCT_CODE: u16 = 1005;
+
+#[derive(Debug)]
+enum ASGIMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(Option<CloseFrame<'static>>),
+}
+
+#[derive(Debug)]
+enum ReceiveEvent {
     Connect,
+    Message(ASGIMessage),
 }
 
 #[pyclass]
-pub struct ReceiveFunc {
-    pub rx: AsyncReceiver<ReceiveType>,
+struct Receiver {
+    ws: Arc<Mutex<UnboundedReceiver<ReceiveEvent>>>,
+}
+
+fn disconnect_evnet(close_frame: Option<CloseFrame<'static>>) -> PyObject {
+    Python::with_gil(|py| {
+        let _d = PyDict::new(py);
+        _d.set_item("type", ScopeType::WsDisconenct.into_py(py));
+        _d.set_item(
+            "code",
+            close_frame.map_or(DISCONENCT_CODE, |v| u16::from(v.code)),
+        );
+        _d.into()
+    })
 }
 
 #[pymethods]
-impl ReceiveFunc {
-    fn __call__<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        let _rx = self.rx.clone();
+impl Receiver {
+    fn __call__(&mut self) -> PyAsync<Result<PyObject>> {
+        debug!("ws: recv called");
+        let ws = self.ws.clone();
+        async move {
+            let event = ws.lock().await.recv().await;
+            if event.is_none() {
+                return Ok(disconnect_evnet(None));
+            }
 
-        // TODO: change to AwaitableObj
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let _type = _rx.recv().await.unwrap();
-
-            let _d = Python::with_gil(|py| -> PyResult<PyObject> {
-                let dict = PyDict::new(py);
-                match _type {
-                    ReceiveType::Disconnect(code) => {
-                        dict.set_item("type", "websocket.disconnect")?;
-                        dict.set_item("code", code)?;
-                    }
-                    ReceiveType::Connect => {
-                        dict.set_item("type", "websocket.connect")?;
-                    }
-                    ReceiveType::Receive(message) => {
-                        dict.set_item("type", "websocket.receive")?;
-                        if message.is_text() {
-                            dict.set_item("text", message.clone().into_text().unwrap())?;
-                        }
-
-                        if message.is_binary() {
-                            dict.set_item("bytes", PyBytes::new(py, message.into_data().as_ref()))?;
-                        }
-                    }
-                };
-
-                Ok(dict.to_object(py))
-            })?;
-            debug!("receive {}", _d);
-            Ok(_d)
-        })
+            match event.unwrap() {
+                ReceiveEvent::Connect => Ok(Python::with_gil(|py| {
+                    let _d = PyDict::new(py);
+                    _d.set_item("type", ScopeType::WsConnect.into_py(py));
+                    _d.into()
+                })),
+                ReceiveEvent::Message(msg) => match msg {
+                    ASGIMessage::Text(txt) => Ok(Python::with_gil(|py| {
+                        let _d = PyDict::new(py);
+                        _d.set_item("type", ScopeType::WsReceive.into_py(py));
+                        _d.set_item("text", txt);
+                        _d.into()
+                    })),
+                    ASGIMessage::Binary(bin) => Ok(Python::with_gil(|py| {
+                        let _d = PyDict::new(py);
+                        _d.set_item("type", ScopeType::WsReceive.into_py(py));
+                        _d.set_item("bytes", bin);
+                        _d.into()
+                    })),
+                    ASGIMessage::Close(frame) => Ok(disconnect_evnet(frame)),
+                },
+            }
+        }
+        .into()
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum SendType {
-    Send(Message),
-    Close((u16, String)),
+async fn receive_loop(
+    cfg: &'static Config,
+    mut ws: SplitStream<WebSocketStream<hyper::upgrade::Upgraded>>,
+    recv_tx: UnboundedSender<ReceiveEvent>,
+    ws_tx: UnboundedSender<Message>,
+) -> Result<()> {
+    while let Some(message) = ws.next().await {
+        let message = message?;
+
+        if message.is_ping() {
+            let msg = message.into_data();
+            ws_tx.send(Message::Pong(msg)).unwrap();
+            continue;
+        }
+
+        if message.is_pong() {
+            let msg = message.into_data();
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let started = u128::from_le_bytes(msg[0..16].try_into().unwrap());
+            let timeout: u128 = (cfg.ws.ping_timeout * 1000.0) as u128;
+            if now - started > timeout {
+            }
+            continue;
+        }
+
+        match message {
+            Message::Text(msg) => recv_tx.send(ReceiveEvent::Message(ASGIMessage::Text(msg)))?,
+            Message::Binary(msg) => {
+                recv_tx.send(ReceiveEvent::Message(ASGIMessage::Binary(msg)))?
+            }
+            Message::Close(msg) => recv_tx.send(ReceiveEvent::Message(ASGIMessage::Close(msg)))?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SendEvent {
     Accept(Headers),
+    Message(ASGIMessage),
 }
 
 #[pyclass]
-pub struct SendFunc {
-    pub tx: UnboundedSender<SendType>,
+struct Sender {
+    ws: UnboundedSender<SendEvent>,
 }
 
 #[pymethods]
-impl SendFunc {
-    fn __call__(&self, scope: &PyDict) -> PyResult<AwaitableObj> {
-        debug!("send {}", scope);
-        let _type = scope.get_item("type").unwrap().to_string();
-        let result: Result<(), Error> = match _type.as_str() {
-            "websocket.accept" => {
-                let subprotocol = scope.get_item("subprotocol");
-                let mut headers = scope.get_item("headers").unwrap().extract::<Headers>()?;
+impl Sender {
+    fn __call__(&self, scope: &PyDict) -> PyAsync<Result<()>> {
+        debug!("send called {:?}", scope);
+        let _type = scope
+            .get_item("type")
+            .expect("type required")
+            .extract::<ScopeType>()
+            .unwrap();
 
-                if let Some(subprotocol) = subprotocol {
+        let result: Result<()> = match _type {
+            ScopeType::WsAccept => {
+                let subprotocol = scope.get_item("subprotocol");
+                let mut headers = scope
+                    .get_item("headers")
+                    .unwrap()
+                    .extract::<Headers>()
+                    .unwrap();
+
+                if subprotocol.is_some() {
+                    let subprotocol = subprotocol.unwrap();
+
                     if !subprotocol.is_none() {
                         let subprotocol = subprotocol.extract::<String>().unwrap();
                         headers.push(vec![b"sec-websocket-protocol".to_vec(), subprotocol.into()]);
                     }
                 }
 
-                self.tx.send(SendType::Accept(headers)).unwrap();
+                self.ws.send(SendEvent::Accept(headers)).unwrap();
                 Ok(())
             }
-            "websocket.close" => {
+            ScopeType::WsSend => {
+                let bytes = scope.get_item("bytes");
+                let text = scope.get_item("text");
+                if bytes.is_none() && text.is_none() {
+                    panic!("bytes or text must exists");
+                }
+
+                if let Some(bytes) = bytes {
+                    self.ws
+                        .send(SendEvent::Message(ASGIMessage::Binary(
+                            bytes.extract::<Vec<u8>>().unwrap(),
+                        )))
+                        .unwrap();
+                }
+
+                if let Some(text) = text {
+                    self.ws
+                        .send(SendEvent::Message(ASGIMessage::Text(
+                            text.extract::<String>().unwrap(),
+                        )))
+                        .unwrap();
+                }
+                Ok(())
+            }
+            ScopeType::WsClose => {
                 let mut code = 1000;
                 let code_none = scope.get_item("code");
                 if let Some(_code) = code_none {
@@ -104,136 +204,85 @@ impl SendFunc {
                 let mut reason = "".to_string();
                 let reason_none = scope.get_item("reason");
                 if let Some(_reason) = reason_none {
-                    reason = _reason
-                        .extract::<String>()
-                        .unwrap_or_else(|_| "".to_string());
+                    reason = _reason.extract::<String>().unwrap_or("".to_string());
                 }
-                self.tx.send(SendType::Close((code, reason))).unwrap();
+                self.ws
+                    .send(SendEvent::Message(ASGIMessage::Close(Some(CloseFrame {
+                        code: CloseCode::from(code),
+                        reason: reason.into(),
+                    }))))
+                    .unwrap();
                 Ok(())
             }
-            "websocket.send" => {
-                let bytes = scope.get_item("bytes");
-                let text = scope.get_item("text");
-                if bytes.is_none() && text.is_none() {
-                    panic!("bytes or text must exists");
-                }
-
-                if let Some(bytes) = bytes {
-                    self.tx
-                        .send(SendType::Send(Message::Binary(bytes.extract::<Vec<u8>>()?)))
-                        .unwrap();
-                }
-
-                if let Some(text) = text {
-                    self.tx
-                        .send(SendType::Send(Message::Text(text.extract::<String>()?)))
-                        .unwrap();
-                }
-                Ok(())
-            }
-            _ => panic!("unknown type {}", _type),
+            _ => panic!(
+                "unsupported type {}; available {} {} {}",
+                _type,
+                ScopeType::WsAccept,
+                ScopeType::WsSend,
+                ScopeType::WsClose,
+            ),
         };
-
-        match result {
-            Ok(_) => Ok(AwaitableObj::default()),
-            Err(e) => {
-                error!("{}", e.to_string());
-                Ok(AwaitableObj::default())
-            }
-        }
-    }
-}
-
-enum ClosedReason {
-    Client,
-    Server,
-}
-
-async fn receive_loop(
-    recv_tx: AsyncSender<ReceiveType>,
-    mut rx: SplitStream<WebSocketStream<hyper::upgrade::Upgraded>>,
-    tx: UnboundedSender<Message>,
-) -> Result<ClosedReason> {
-    while let Some(message) = rx.next().await {
-        match message? {
-            Message::Text(msg) => {
-                recv_tx
-                    .send(ReceiveType::Receive(Message::Text(msg)))
-                    .await
-                    .unwrap();
-            }
-            Message::Binary(msg) => {
-                recv_tx
-                    .send(ReceiveType::Receive(Message::Binary(msg)))
-                    .await
-                    .unwrap();
-            }
-            Message::Close(msg) => {
-                if let Some(msg) = &msg {
-                    recv_tx
-                        .send(ReceiveType::Disconnect(u16::from(msg.code)))
-                        .await
-                        .unwrap();
-                } else {
-                    recv_tx.send(ReceiveType::Disconnect(1005)).await.unwrap();
+        async {
+            match result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!("{}", e);
+                    Ok(())
                 }
-                return Ok(ClosedReason::Client);
             }
-            Message::Ping(msg) => {
-                tx.send(Message::Pong(msg)).unwrap();
-            }
-            _ => {}
         }
+        .into()
     }
-    Ok(ClosedReason::Server)
 }
 
 async fn send_loop(
-    mut send_rx: UnboundedReceiver<SendType>,
-    tx: UnboundedSender<Message>,
-) -> Result<ClosedReason> {
-    loop {
-        let connected = tx.send(Message::Ping(vec![]));
-        if let Err(_e) = connected {
-            break;
-        }
-        if let Ok(_type) = send_rx.try_recv() {
-            debug!("serve send {:?}", _type);
-            match _type {
-                SendType::Close((code, reason)) => {
-                    tx.send(Message::Close(Some(CloseFrame {
-                        code: CloseCode::from(code),
-                        reason: reason.into(),
-                    })))
-                    .unwrap();
-                    return Ok(ClosedReason::Server);
-                }
-                SendType::Send(msg) => tx.send(msg).unwrap(),
-                _ => error!("Accept again not working"),
-            }
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+    mut send_rx: UnboundedReceiver<SendEvent>,
+    ws_tx: UnboundedSender<Message>,
+) -> Result<()> {
+    while let Some(message) = send_rx.recv().await {
+        match message {
+            SendEvent::Message(amsg) => match amsg {
+                ASGIMessage::Text(msg) => ws_tx.send(Message::Text(msg))?,
+                ASGIMessage::Binary(msg) => ws_tx.send(Message::Binary(msg))?,
+                ASGIMessage::Close(msg) => ws_tx.send(Message::Close(msg))?,
+                _ => {}
+            },
+            _ => return Err(anyhow!("called accept twice",)),
+        };
     }
-    Ok(ClosedReason::Client)
+    Ok(())
+}
+
+async fn ping_loop(cfg: &'static Config, ws: UnboundedSender<Message>) -> Result<()> {
+    loop {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        ws.send(Message::Ping(now.to_le_bytes().to_vec()))?;
+        tokio::time::sleep(tokio::time::Duration::from_secs_f32(cfg.ws.ping_interval)).await;
+    }
 }
 
 async fn serve_ws(
+    cfg: &'static Config,
     ws: HyperWebsocket,
-    send_rx: UnboundedReceiver<SendType>,
-    recv_tx: AsyncSender<ReceiveType>,
+    send_rx: UnboundedReceiver<SendEvent>,
+    recv_tx: UnboundedSender<ReceiveEvent>,
 ) -> Result<()> {
     let websocket = ws.await?;
-    let (mut tx, rx) = websocket.split();
+    let (mut ws_tx, ws_rx) = websocket.split();
     let (message_tx, mut message_rx) = unbounded_channel::<Message>();
 
-    let recv_fut = tokio::spawn(receive_loop(recv_tx, rx, message_tx.clone()));
+    let recv_fut = tokio::spawn(receive_loop(ws_rx, recv_tx, message_tx.clone()));
 
     let send_fut = tokio::spawn(send_loop(send_rx, message_tx.clone()));
 
+    let ping_fut = tokio::spawn(ping_loop(cfg, message_tx.clone()));
+
     let sender_fut = tokio::spawn(async move {
         while let Some(msg) = message_rx.recv().await {
-            let connected = tx.send(msg).await;
+            let connected = ws_tx.send(msg).await;
             if let Err(e) = connected {
                 info!("close websocket {}", e.to_string());
                 break;
@@ -251,59 +300,66 @@ async fn serve_ws(
         _val = sender_fut => {
             info!("terminated");
         }
+        _val = ping_fut => {
+            info!("terminated");
+        }
     }
 
     Ok(())
 }
 
-pub fn handle(app: PyObject, addr: SocketAddr, mut req: Request<Body>) -> FutureResponse {
-    let (send_tx, mut send_rx) = unbounded_channel::<SendType>();
-    let (recv_tx, recv_rx) = unbounded::<ReceiveType>();
-    let send = SendFunc { tx: send_tx };
-    let receive = ReceiveFunc { rx: recv_rx };
+pub fn handle(
+    cfg: &'static Config,
+    addr: SocketAddr,
+    mut req: Request<IncomingBody>,
+    tx: UnboundedSender<ScopeRecvSend>,
+) -> FutureResponse {
+    let (send_tx, mut send_rx) = unbounded_channel();
+    let (recv_tx, recv_rx) = unbounded_channel();
 
-    let scope = Python::with_gil(|py| {
-        configure_scope(ScopeType::Ws, py, &req, addr)
-            .unwrap()
-            .to_object(py)
-    });
-    let fut = Python::with_gil(|py| {
-        let args = (scope, receive.into_py(py), send.into_py(py));
-        let coro = app.call1(py, args).unwrap();
-        pyo3_asyncio::into_future_with_locals(&locals, coro.as_ref(py))
-    })
-    .unwrap();
-    let call_app = tokio::spawn(fut);
+    let sender = Sender { ws: send_tx };
+
+    let upgrade_result = upgrade(&mut req, None);
+
+    let (parts, _body) = req.into_parts();
+    let receiver = Receiver {
+        ws: Arc::new(Mutex::new(recv_rx)),
+    };
+
+    let scope = Scope::new(parts, addr, ScopeType::Ws);
+    debug!("{:?}", scope);
+
+    let args = Python::with_gil(|py| (scope.into_py(py), receiver.into_py(py), sender.into_py(py)));
 
     Box::pin(async move {
-        recv_tx.send(ReceiveType::Connect).await.unwrap();
+        let result = tx.send(Some(args));
+        if let Err(e) = result {
+            return Ok(HttpError::internal_error(e.into()));
+        }
+
+        let result = recv_tx.send(ReceiveEvent::Connect);
+        if let Err(e) = result {
+            return Ok(HttpError::internal_error(e.into()));
+        }
+
         debug!("wait accept");
+        let accept = send_rx.recv().await;
+        if accept.is_none() {
+            return Ok(HttpError::forbidden("not accept"));
+        }
+        match accept.unwrap() {
+            SendEvent::Accept(headers) => {
+                if let Err(e) = upgrade_result {
+                    return Ok(HttpError::internal_error(e.into()));
+                }
 
-        let accept = send_rx.recv().await.unwrap();
-
-        let mut response = match accept {
-            SendType::Accept(headers) => {
-                debug!("accept {:?}", headers);
-                let (mut response, ws) = hyper_tungstenite::upgrade(&mut req, None).unwrap();
+                let (mut response, ws) = upgrade_result.unwrap();
 
                 insert_headers(&mut response, headers).unwrap();
-                let serve_fut = serve_ws(ws, send_rx, recv_tx);
-
-                tokio::spawn(async move {
-                    if let Err(e) = serve_fut.await {
-                        error!("Error in websocket connection: {}", e);
-                    }
-                    call_app.abort();
-                });
-                response
+                (*response.headers_mut()).append("server", server_header!());
+                Ok(response)
             }
-            _ => {
-                let mut r = Response::default();
-                *r.status_mut() = StatusCode::FORBIDDEN;
-                r
-            }
-        };
-        (*response.headers_mut()).append("server", server_header!());
-        Ok(response)
+            _ => Ok(HttpError::forbidden("not accept")),
+        }
     })
 }

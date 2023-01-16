@@ -21,8 +21,6 @@ class Item(BaseModel):
 
 @app.get("/")
 async def read_root(req: Request):
-    for i in req:
-        print(i)
     return {"Hello": "World"}
 
 
@@ -45,5 +43,9 @@ if __name__ == '__main__':
     import rusticorn
 
     rusticorn.run(
-        app, "0.0.0.0:8000")  #, "http"False, "./examples/certs/localhost.pem",
-    # "./examples/certs/localhost-key.pem")
+        app,
+        "0.0.0.0:8000",
+        "http2",
+        "./examples/certs/localhost.pem",
+        "./examples/certs/localhost-key.pem",
+    )

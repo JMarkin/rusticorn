@@ -20,7 +20,6 @@ def run_server(
     ws_ping_timeout=20.0,
 ):
     cfg = Config(
-        "",
         bind,
         http_version,
         cert_path,

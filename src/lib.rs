@@ -10,6 +10,7 @@ mod py_future;
 mod scope;
 mod server;
 mod utils;
+mod tungstenite;
 
 use std::thread;
 
@@ -30,9 +31,8 @@ fn start_server(py: Python, cfg: Config) -> Result<ASGIServer> {
                 .build()
                 .expect("build runtime");
 
-            // Combine it with a `LocalSet,  which means it can spawn !Send futures...
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, crate::server::start_server(cfg, tx, stop_tx)) //, _event_loop, _asyncio))
+            local.block_on(&rt, crate::server::start_server(&cfg, tx, stop_tx))
         })
     });
 
@@ -44,5 +44,6 @@ fn rusticorn(_py: Python, m: &PyModule) -> PyResult<()> {
     pyo3_log::init();
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<Config>()?;
+    m.add_class::<Scope>()?;
     Ok(())
 }

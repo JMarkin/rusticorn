@@ -2,19 +2,12 @@
 use {
     futures::{
         future::{BoxFuture, FutureExt},
-        stream::{BoxStream, Stream, StreamExt},
         task::{waker_ref, ArcWake},
     },
     once_cell::sync::OnceCell,
     pyo3::{
-        callback::IntoPyCallbackOutput,
-        exceptions::{asyncio::CancelledError, PyStopAsyncIteration},
-        ffi,
-        iter::IterNextOutput,
-        prelude::*,
-        pyasync::IterANextOutput,
-        types::IntoPyDict,
-        PyTypeInfo,
+        callback::IntoPyCallbackOutput, exceptions::asyncio::CancelledError, ffi,
+        iter::IterNextOutput, prelude::*, types::IntoPyDict, PyTypeInfo,
     },
     std::{
         future::Future,
@@ -24,25 +17,6 @@ use {
         task::{Context, Poll},
     },
 };
-
-#[pyclass]
-#[derive(Default)]
-pub struct AwaitableObj {}
-
-#[pymethods]
-impl AwaitableObj {
-    fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
-        slf // We're saying that we are the iterable part of the coroutine.
-    }
-
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(_slf: PyRefMut<'_, Self>) -> IterNextOutput<Option<PyObject>, Option<PyObject>> {
-        IterNextOutput::Return(None)
-    }
-}
 
 fn monkey_patch_into_accepted_coro_types<T: PyTypeInfo>(py: Python) -> PyResult<&()> {
     static MONKEY_PATCHED: OnceCell<()> = OnceCell::new();
@@ -205,7 +179,7 @@ impl PyFuture {
     /// https://github.com/python/cpython/blob/17ef4319a34f5a2f95e7823dfb5f5b8cff11882d/Lib/asyncio/futures.py#L159
     fn schedule_callbacks(mut slf: PyRefMut<Self>) -> PyResult<()> {
         if slf.callbacks.is_empty() {
-            panic!("nothing to call back")
+            return Ok(());
         }
         let callbacks = std::mem::take(&mut slf.callbacks);
         let py = slf.py();
