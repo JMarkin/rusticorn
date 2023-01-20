@@ -61,4 +61,8 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == '__main__':
     import rusticorn
 
-    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key.pem")
+    rusticorn.run(
+        app,
+        "0.0.0.0:8000",
+        "http1",
+    )

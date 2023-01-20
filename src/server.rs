@@ -29,7 +29,7 @@ where
 struct Svc {
     addr: SocketAddr,
     tx: UnboundedSender<ScopeRecvSend>,
-    cfg: &'static Config,
+    cfg: Config,
 }
 
 impl Service<Request<IncomingBody>> for Svc {
@@ -38,12 +38,12 @@ impl Service<Request<IncomingBody>> for Svc {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&mut self, req: Request<IncomingBody>) -> Self::Future {
-        let cfg = self.cfg;
+        let cfg = self.cfg.clone();
         let addr = self.addr;
         let tx = self.tx.clone();
 
         if is_upgrade_request(&req) {
-            crate::protocol::ws::handle(cfg, addr, req, tx)
+            crate::protocol::ws::handle(addr, req, tx, cfg.ws.ping_timeout, cfg.ws.ping_interval)
         } else {
             crate::protocol::http::handle(addr, req, tx)
         }
@@ -111,7 +111,7 @@ impl ASGIServer {
 const HTTP2_ALPN: [u8; 2] = [104, 50];
 
 pub async fn start_server(
-    cfg: &'static Config,
+    cfg: Config,
     tx: UnboundedSender<ScopeRecvSend>,
     stop_tx: Sender<bool>,
 ) -> Result<()> {
@@ -164,7 +164,7 @@ pub async fn start_server(
             let service = Svc {
                 addr: peer_addr,
                 tx: tx.clone(),
-                cfg: &cfg,
+                cfg: cfg.clone(),
             };
 
             if cfg.tls.is_some() {

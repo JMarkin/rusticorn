@@ -9,8 +9,8 @@ mod protocol;
 mod py_future;
 mod scope;
 mod server;
-mod utils;
 mod tungstenite;
+mod utils;
 
 use std::thread;
 
@@ -32,7 +32,7 @@ fn start_server(py: Python, cfg: Config) -> Result<ASGIServer> {
                 .expect("build runtime");
 
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, crate::server::start_server(&cfg, tx, stop_tx))
+            local.block_on(&rt, crate::server::start_server(cfg, tx, stop_tx))
         })
     });
 

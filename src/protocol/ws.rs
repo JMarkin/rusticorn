@@ -1,13 +1,9 @@
-use std::{
-    cell::RefCell,
-    sync::{Arc, RwLock},
-    time::SystemTime,
-};
+use std::{sync::Arc, time::SystemTime};
 
 use crate::{prelude::*, server_header};
-use anyhow::Error;
 use futures::{stream::SplitStream, SinkExt, StreamExt};
-use hyper::{Request, StatusCode};
+use hyper::Request;
+use once_cell::sync::OnceCell;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     Mutex,
@@ -28,6 +24,30 @@ enum ASGIMessage {
     Close(Option<CloseFrame<'static>>),
 }
 
+static PY_RECEIVER: &str = "
+import asyncio
+
+def create_recv(recv):
+    async def f():
+        while 1:
+            resp = await recv()
+            if resp:
+                return resp
+            await asyncio.sleep(0.001)
+    return f
+";
+
+fn create_recv(py: Python) -> PyResult<&PyObject> {
+    static CREATE_RECV: OnceCell<PyObject> = OnceCell::new();
+    CREATE_RECV.get_or_try_init(|| {
+        let create_recv: PyObject = PyModule::from_code(py, PY_RECEIVER, "", "")?
+            .getattr("create_recv")?
+            .into();
+
+        Ok(create_recv)
+    })
+}
+
 #[derive(Debug)]
 enum ReceiveEvent {
     Connect,
@@ -39,49 +59,50 @@ struct Receiver {
     ws: Arc<Mutex<UnboundedReceiver<ReceiveEvent>>>,
 }
 
-fn disconnect_evnet(close_frame: Option<CloseFrame<'static>>) -> PyObject {
+fn disconnect_event(close_frame: Option<CloseFrame<'static>>) -> Result<PyObject> {
     Python::with_gil(|py| {
         let _d = PyDict::new(py);
-        _d.set_item("type", ScopeType::WsDisconenct.into_py(py));
+        _d.set_item("type", ScopeType::WsDisconenct.into_py(py))?;
         _d.set_item(
             "code",
             close_frame.map_or(DISCONENCT_CODE, |v| u16::from(v.code)),
-        );
-        _d.into()
+        )?;
+        Ok(_d.into())
     })
 }
 
 #[pymethods]
 impl Receiver {
     fn __call__(&mut self) -> PyAsync<Result<PyObject>> {
-        debug!("ws: recv called");
         let ws = self.ws.clone();
         async move {
             let event = ws.lock().await.recv().await;
             if event.is_none() {
-                return Ok(disconnect_evnet(None));
+                return Python::with_gil(|py| Ok(().into_py(py)));
             }
 
-            match event.unwrap() {
-                ReceiveEvent::Connect => Ok(Python::with_gil(|py| {
+            let event = event.unwrap();
+            debug!("ws: recv event {:?}", event);
+            match event {
+                ReceiveEvent::Connect => Python::with_gil(|py| {
                     let _d = PyDict::new(py);
-                    _d.set_item("type", ScopeType::WsConnect.into_py(py));
-                    _d.into()
-                })),
+                    _d.set_item("type", ScopeType::WsConnect.into_py(py))?;
+                    Ok(_d.into())
+                }),
                 ReceiveEvent::Message(msg) => match msg {
-                    ASGIMessage::Text(txt) => Ok(Python::with_gil(|py| {
+                    ASGIMessage::Text(txt) => Python::with_gil(|py| {
                         let _d = PyDict::new(py);
-                        _d.set_item("type", ScopeType::WsReceive.into_py(py));
-                        _d.set_item("text", txt);
-                        _d.into()
-                    })),
-                    ASGIMessage::Binary(bin) => Ok(Python::with_gil(|py| {
+                        _d.set_item("type", ScopeType::WsReceive.into_py(py))?;
+                        _d.set_item("text", txt)?;
+                        Ok(_d.into())
+                    }),
+                    ASGIMessage::Binary(bin) => Python::with_gil(|py| {
                         let _d = PyDict::new(py);
-                        _d.set_item("type", ScopeType::WsReceive.into_py(py));
-                        _d.set_item("bytes", bin);
-                        _d.into()
-                    })),
-                    ASGIMessage::Close(frame) => Ok(disconnect_evnet(frame)),
+                        _d.set_item("type", ScopeType::WsReceive.into_py(py))?;
+                        _d.set_item("bytes", bin)?;
+                        Ok(_d.into())
+                    }),
+                    ASGIMessage::Close(frame) => disconnect_event(frame),
                 },
             }
         }
@@ -90,11 +111,12 @@ impl Receiver {
 }
 
 async fn receive_loop(
-    cfg: &'static Config,
+    ping_timeout: f32,
     mut ws: SplitStream<WebSocketStream<hyper::upgrade::Upgraded>>,
     recv_tx: UnboundedSender<ReceiveEvent>,
     ws_tx: UnboundedSender<Message>,
 ) -> Result<()> {
+    let timeout: u128 = (ping_timeout * 1000.0) as u128;
     while let Some(message) = ws.next().await {
         let message = message?;
 
@@ -104,20 +126,17 @@ async fn receive_loop(
             continue;
         }
 
-        if message.is_pong() {
-            let msg = message.into_data();
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let started = u128::from_le_bytes(msg[0..16].try_into().unwrap());
-            let timeout: u128 = (cfg.ws.ping_timeout * 1000.0) as u128;
-            if now - started > timeout {
-            }
-            continue;
-        }
-
         match message {
+            Message::Pong(msg) => {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let started = u128::from_le_bytes(msg[0..16].try_into().unwrap());
+                if now - started > timeout {
+                    return Err(anyhow!("pong receive {} > {}: timeout", now, started));
+                }
+            }
             Message::Text(msg) => recv_tx.send(ReceiveEvent::Message(ASGIMessage::Text(msg)))?,
             Message::Binary(msg) => {
                 recv_tx.send(ReceiveEvent::Message(ASGIMessage::Binary(msg)))?
@@ -150,48 +169,38 @@ impl Sender {
             .extract::<ScopeType>()
             .unwrap();
 
-        let result: Result<()> = match _type {
+        let result: Result<()> = (|| match _type {
             ScopeType::WsAccept => {
                 let subprotocol = scope.get_item("subprotocol");
-                let mut headers = scope
-                    .get_item("headers")
-                    .unwrap()
-                    .extract::<Headers>()
-                    .unwrap();
+                let mut headers = scope.get_item("headers").unwrap().extract::<Headers>()?;
 
-                if subprotocol.is_some() {
-                    let subprotocol = subprotocol.unwrap();
-
+                if let Some(subprotocol) = subprotocol {
                     if !subprotocol.is_none() {
-                        let subprotocol = subprotocol.extract::<String>().unwrap();
+                        let subprotocol = subprotocol.extract::<String>()?;
                         headers.push(vec![b"sec-websocket-protocol".to_vec(), subprotocol.into()]);
                     }
                 }
 
-                self.ws.send(SendEvent::Accept(headers)).unwrap();
+                self.ws.send(SendEvent::Accept(headers))?;
                 Ok(())
             }
             ScopeType::WsSend => {
                 let bytes = scope.get_item("bytes");
                 let text = scope.get_item("text");
                 if bytes.is_none() && text.is_none() {
-                    panic!("bytes or text must exists");
+                    return Err(anyhow!("bytes or text must exists"));
                 }
 
                 if let Some(bytes) = bytes {
-                    self.ws
-                        .send(SendEvent::Message(ASGIMessage::Binary(
-                            bytes.extract::<Vec<u8>>().unwrap(),
-                        )))
-                        .unwrap();
+                    self.ws.send(SendEvent::Message(ASGIMessage::Binary(
+                        bytes.extract::<Vec<u8>>()?,
+                    )))?;
                 }
 
                 if let Some(text) = text {
-                    self.ws
-                        .send(SendEvent::Message(ASGIMessage::Text(
-                            text.extract::<String>().unwrap(),
-                        )))
-                        .unwrap();
+                    self.ws.send(SendEvent::Message(ASGIMessage::Text(
+                        text.extract::<String>()?,
+                    )))?;
                 }
                 Ok(())
             }
@@ -204,24 +213,24 @@ impl Sender {
                 let mut reason = "".to_string();
                 let reason_none = scope.get_item("reason");
                 if let Some(_reason) = reason_none {
-                    reason = _reason.extract::<String>().unwrap_or("".to_string());
+                    reason = _reason.extract::<String>().unwrap_or(reason);
                 }
+                debug!("close websocket code: {} reason: {}", code, reason);
                 self.ws
                     .send(SendEvent::Message(ASGIMessage::Close(Some(CloseFrame {
                         code: CloseCode::from(code),
                         reason: reason.into(),
-                    }))))
-                    .unwrap();
+                    }))))?;
                 Ok(())
             }
-            _ => panic!(
+            _ => Err(anyhow!(
                 "unsupported type {}; available {} {} {}",
                 _type,
                 ScopeType::WsAccept,
                 ScopeType::WsSend,
                 ScopeType::WsClose,
-            ),
-        };
+            )),
+        })();
         async {
             match result {
                 Ok(_) => Ok(()),
@@ -240,12 +249,12 @@ async fn send_loop(
     ws_tx: UnboundedSender<Message>,
 ) -> Result<()> {
     while let Some(message) = send_rx.recv().await {
+        debug!("try send {:?} in send loop", message);
         match message {
             SendEvent::Message(amsg) => match amsg {
                 ASGIMessage::Text(msg) => ws_tx.send(Message::Text(msg))?,
                 ASGIMessage::Binary(msg) => ws_tx.send(Message::Binary(msg))?,
                 ASGIMessage::Close(msg) => ws_tx.send(Message::Close(msg))?,
-                _ => {}
             },
             _ => return Err(anyhow!("called accept twice",)),
         };
@@ -253,35 +262,31 @@ async fn send_loop(
     Ok(())
 }
 
-async fn ping_loop(cfg: &'static Config, ws: UnboundedSender<Message>) -> Result<()> {
+async fn ping_loop(ping_interval: f32, ws: UnboundedSender<Message>) -> Result<()> {
     loop {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         ws.send(Message::Ping(now.to_le_bytes().to_vec()))?;
-        tokio::time::sleep(tokio::time::Duration::from_secs_f32(cfg.ws.ping_interval)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs_f32(ping_interval)).await;
     }
 }
 
 async fn serve_ws(
-    cfg: &'static Config,
     ws: HyperWebsocket,
     send_rx: UnboundedReceiver<SendEvent>,
     recv_tx: UnboundedSender<ReceiveEvent>,
+    ping_timeout: f32,
+    ping_interval: f32,
 ) -> Result<()> {
     let websocket = ws.await?;
     let (mut ws_tx, ws_rx) = websocket.split();
     let (message_tx, mut message_rx) = unbounded_channel::<Message>();
 
-    let recv_fut = tokio::spawn(receive_loop(ws_rx, recv_tx, message_tx.clone()));
-
-    let send_fut = tokio::spawn(send_loop(send_rx, message_tx.clone()));
-
-    let ping_fut = tokio::spawn(ping_loop(cfg, message_tx.clone()));
-
-    let sender_fut = tokio::spawn(async move {
+    let sender_fut = tokio::task::spawn_local(async move {
         while let Some(msg) = message_rx.recv().await {
+            debug!("try send {}", msg);
             let connected = ws_tx.send(msg).await;
             if let Err(e) = connected {
                 info!("close websocket {}", e.to_string());
@@ -289,6 +294,17 @@ async fn serve_ws(
             }
         }
     });
+
+    let recv_fut = tokio::task::spawn_local(receive_loop(
+        ping_timeout,
+        ws_rx,
+        recv_tx,
+        message_tx.clone(),
+    ));
+
+    let send_fut = tokio::task::spawn_local(send_loop(send_rx, message_tx.clone()));
+
+    let ping_fut = tokio::task::spawn_local(ping_loop(ping_interval, message_tx.clone()));
 
     tokio::select! {
         _val = recv_fut => {
@@ -298,10 +314,10 @@ async fn serve_ws(
             info!("terminated by server");
         }
         _val = sender_fut => {
-            info!("terminated");
+            info!("terminated by sender");
         }
         _val = ping_fut => {
-            info!("terminated");
+            info!("terminated by ping");
         }
     }
 
@@ -309,10 +325,11 @@ async fn serve_ws(
 }
 
 pub fn handle(
-    cfg: &'static Config,
     addr: SocketAddr,
     mut req: Request<IncomingBody>,
     tx: UnboundedSender<ScopeRecvSend>,
+    ping_timeout: f32,
+    ping_interval: f32,
 ) -> FutureResponse {
     let (send_tx, mut send_rx) = unbounded_channel();
     let (recv_tx, recv_rx) = unbounded_channel();
@@ -329,7 +346,13 @@ pub fn handle(
     let scope = Scope::new(parts, addr, ScopeType::Ws);
     debug!("{:?}", scope);
 
-    let args = Python::with_gil(|py| (scope.into_py(py), receiver.into_py(py), sender.into_py(py)));
+    let args = Python::with_gil(|py| {
+        let recv = create_recv(py)
+            .unwrap()
+            .call1(py, (receiver.into_py(py),))
+            .unwrap();
+        (scope.into_py(py), recv, sender.into_py(py))
+    });
 
     Box::pin(async move {
         let result = tx.send(Some(args));
@@ -354,6 +377,14 @@ pub fn handle(
                 }
 
                 let (mut response, ws) = upgrade_result.unwrap();
+                debug!("accepted");
+                tokio::task::spawn_local(serve_ws(
+                    ws,
+                    send_rx,
+                    recv_tx,
+                    ping_timeout,
+                    ping_interval,
+                ));
 
                 insert_headers(&mut response, headers).unwrap();
                 (*response.headers_mut()).append("server", server_header!());
