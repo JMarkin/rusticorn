@@ -9,7 +9,6 @@ mod protocol;
 mod py_future;
 mod scope;
 mod server;
-mod tungstenite;
 mod utils;
 
 use std::thread;

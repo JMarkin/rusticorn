@@ -1,8 +1,10 @@
 use crate::prelude::*;
 use hyper::server::conn::{http1, http2};
+use hyper_tungstenite::is_upgrade_request;
 use std::fs;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
@@ -56,11 +58,14 @@ macro_rules! spawn_service {
             if let Err(err) = match $http_version {
                 HttpVersion::HTTP1 => {
                     http1::Builder::new()
+                        .keep_alive(true)
                         .serve_connection($stream, $service)
+                        .with_upgrades()
                         .await
                 }
                 HttpVersion::HTTP2 => {
                     http2::Builder::new(LocalExec)
+                        .keep_alive_interval(Some(Duration::from_millis(100)))
                         .serve_connection($stream, $service)
                         .await
                 }
@@ -90,7 +95,12 @@ impl ASGIServer {
 impl ASGIServer {
     fn req(&self) -> PyAsync<Option<(PyObject, PyObject, PyObject)>> {
         let rx = self.rx.clone();
-        async move { rx.lock().await.recv().await.unwrap_or_default() }.into()
+        async move {
+            let mut lock = rx.lock().await;
+            let data = lock.recv().await.unwrap();
+            data
+        }
+        .into()
     }
     fn stop(&self) -> PyResult<bool> {
         let rx = self.stop_rx.clone();

@@ -5,7 +5,7 @@ use std::{
 
 use crate::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
-use http_body_util::StreamBody;
+use http_body_util::{Full, StreamBody};
 use hyper::body::{Body, Buf, Bytes, Frame, SizeHint};
 use pin_project_lite::pin_project;
 
@@ -88,3 +88,4 @@ impl From<&'static str> for HttpBody<Bytes> {
         }
     }
 }
+

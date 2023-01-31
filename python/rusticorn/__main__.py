@@ -15,8 +15,8 @@ from .server import run_server
 @click.option('--private-path', required=False)
 @click.option('--limit-concurrency', default=None)
 @click.option('--limit-python-execution', default=None)
-@click.option('--ws-ping-interval', default=5.0)
-@click.option('--ws-ping-timeout', default=5.0)
+@click.option('--ws-ping-interval', default=20.0)
+@click.option('--ws-ping-timeout', default=20.0)
 def run(application,
         bind="127.0.0.1:8000",
         http_version="http1",

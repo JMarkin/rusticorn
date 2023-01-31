@@ -1,16 +1,24 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use crate::{prelude::*, server_header};
 use futures::{stream::SplitStream, SinkExt, StreamExt};
 use hyper::Request;
+use hyper_tungstenite::{
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    },
+    WebSocketStream,
+};
+use hyper_tungstenite::{upgrade, HyperWebsocket};
 use once_cell::sync::OnceCell;
 use tokio::sync::{
+    broadcast,
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     Mutex,
-};
-use tungstenite::{
-    protocol::{frame::coding::CloseCode, CloseFrame},
-    Message,
 };
 
 use super::common::insert_headers;
@@ -22,30 +30,6 @@ enum ASGIMessage {
     Text(String),
     Binary(Vec<u8>),
     Close(Option<CloseFrame<'static>>),
-}
-
-static PY_RECEIVER: &str = "
-import asyncio
-
-def create_recv(recv):
-    async def f():
-        while 1:
-            resp = await recv()
-            if resp:
-                return resp
-            await asyncio.sleep(0.001)
-    return f
-";
-
-fn create_recv(py: Python) -> PyResult<&PyObject> {
-    static CREATE_RECV: OnceCell<PyObject> = OnceCell::new();
-    CREATE_RECV.get_or_try_init(|| {
-        let create_recv: PyObject = PyModule::from_code(py, PY_RECEIVER, "", "")?
-            .getattr("create_recv")?
-            .into();
-
-        Ok(create_recv)
-    })
 }
 
 #[derive(Debug)]
@@ -116,7 +100,7 @@ async fn receive_loop(
     recv_tx: UnboundedSender<ReceiveEvent>,
     ws_tx: UnboundedSender<Message>,
 ) -> Result<()> {
-    let timeout: u128 = (ping_timeout * 1000.0) as u128;
+    let timeout: u128 = Duration::from_millis((ping_timeout * 1000.0) as u64).as_nanos();
     while let Some(message) = ws.next().await {
         let message = message?;
 
@@ -134,7 +118,9 @@ async fn receive_loop(
                     .as_nanos();
                 let started = u128::from_le_bytes(msg[0..16].try_into().unwrap());
                 if now - started > timeout {
-                    return Err(anyhow!("pong receive {} > {}: timeout", now, started));
+                    let msg = format!("pong receive {} > {}: timeout {}", now, started, timeout);
+                    error!("{}", msg);
+                    return Err(anyhow!("{}", msg));
                 }
             }
             Message::Text(msg) => recv_tx.send(ReceiveEvent::Message(ASGIMessage::Text(msg)))?,
@@ -268,7 +254,8 @@ async fn ping_loop(ping_interval: f32, ws: UnboundedSender<Message>) -> Result<(
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        ws.send(Message::Ping(now.to_le_bytes().to_vec()))?;
+        let msg = Message::Ping(now.to_le_bytes().to_vec());
+        ws.send(msg)?;
         tokio::time::sleep(tokio::time::Duration::from_secs_f32(ping_interval)).await;
     }
 }
@@ -286,10 +273,15 @@ async fn serve_ws(
 
     let sender_fut = tokio::task::spawn_local(async move {
         while let Some(msg) = message_rx.recv().await {
-            debug!("try send {}", msg);
+            trace!("try send {}", msg);
+            let is_closed = msg.is_close();
             let connected = ws_tx.send(msg).await;
             if let Err(e) = connected {
                 info!("close websocket {}", e.to_string());
+                break;
+            }
+            if is_closed {
+                ws_tx.close().await.unwrap();
                 break;
             }
         }
@@ -308,16 +300,16 @@ async fn serve_ws(
 
     tokio::select! {
         _val = recv_fut => {
-            info!("terminated by client");
+            debug!("terminated by client {:?}", _val);
         }
         _val = send_fut => {
-            info!("terminated by server");
+            debug!("terminated by server {:?}", _val);
         }
         _val = sender_fut => {
-            info!("terminated by sender");
+            debug!("terminated by sender {:?}", _val);
         }
         _val = ping_fut => {
-            info!("terminated by ping");
+            debug!("terminated by ping {:?}", _val);
         }
     }
 
@@ -346,24 +338,20 @@ pub fn handle(
     let scope = Scope::new(parts, addr, ScopeType::Ws);
     debug!("{:?}", scope);
 
-    let args = Python::with_gil(|py| {
-        let recv = create_recv(py)
-            .unwrap()
-            .call1(py, (receiver.into_py(py),))
-            .unwrap();
-        (scope.into_py(py), recv, sender.into_py(py))
-    });
+    let args = Python::with_gil(|py| (scope.into_py(py), receiver.into_py(py), sender.into_py(py)));
 
     Box::pin(async move {
         let result = tx.send(Some(args));
         if let Err(e) = result {
             return Ok(HttpError::internal_error(e.into()));
         }
+        result.unwrap();
 
         let result = recv_tx.send(ReceiveEvent::Connect);
         if let Err(e) = result {
             return Ok(HttpError::internal_error(e.into()));
         }
+        result.unwrap();
 
         debug!("wait accept");
         let accept = send_rx.recv().await;
@@ -376,7 +364,9 @@ pub fn handle(
                     return Ok(HttpError::internal_error(e.into()));
                 }
 
-                let (mut response, ws) = upgrade_result.unwrap();
+                let (response, ws) = upgrade_result.unwrap();
+                let (parts, _) = response.into_parts();
+                let mut response = Response::from_parts(parts, "".into());
                 debug!("accepted");
                 tokio::task::spawn_local(serve_ws(
                     ws,

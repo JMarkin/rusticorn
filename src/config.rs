@@ -7,11 +7,11 @@ fn default_bind() -> String {
 }
 
 fn default_ping_interval() -> f32 {
-    5.0
+    20.0
 }
 
 fn default_ping_timeout() -> f32 {
-    5.0
+    20.0
 }
 
 #[pyclass(module = "rusticorn")]
