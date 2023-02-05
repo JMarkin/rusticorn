@@ -1,59 +1,48 @@
 #[macro_use]
 extern crate anyhow;
+mod body;
+mod config;
 mod enums;
 mod errors;
 mod prelude;
 mod protocol;
-mod py;
+mod py_future;
 mod scope;
 mod server;
-mod service;
+mod utils;
+
+use std::thread;
+
+use server::ASGIServer;
+use tokio::sync::mpsc::{channel, unbounded_channel};
+
 use crate::prelude::*;
-use server::start_server;
 
 #[pyfunction]
-fn start_app<'a>(
-    py: Python<'a>,
-    app: &'a PyAny,
-    bind: Option<&'a str>,
-    tls: Option<bool>,
-    cert_path: Option<String>,
-    private_path: Option<String>,
-    http_version: Option<String>,
-) -> PyResult<&'a PyAny> {
-    let app: PyObject = app.into();
+fn start_server(py: Python, cfg: Config) -> Result<ASGIServer> {
+    let (tx, rx) = unbounded_channel();
+    let (stop_tx, stop_rx) = channel::<bool>(1);
+    py.allow_threads(move || {
+        thread::spawn(move || {
+            pyo3::prepare_freethreaded_python();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
 
-    let addr = bind.unwrap_or("127.0.0.1:8000").parse()?;
-    let tls = tls.unwrap_or(false);
-    let _http_version: HttpVersion;
-    if let Some(_version) = http_version {
-        _http_version = _version.parse().unwrap_or(HttpVersion::Any);
-    } else {
-        _http_version = HttpVersion::Any;
-    }
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, crate::server::start_server(cfg, tx, stop_tx))
+        })
+    });
 
-    let locals = Python::with_gil(|py| pyo3_asyncio::tokio::get_current_locals(py).unwrap());
-    pyo3_asyncio::tokio::future_into_py(py, async move {
-        match start_server(
-            locals,
-            app,
-            addr,
-            tls,
-            cert_path,
-            private_path,
-            _http_version,
-        )
-        .await
-        {
-            Ok(_v) => Ok(()),
-            Err(e) => panic!("{e}"),
-        }
-    })
+    Ok(ASGIServer::new(rx, stop_rx))
 }
 
 #[pymodule]
 fn rusticorn(_py: Python, m: &PyModule) -> PyResult<()> {
     pyo3_log::init();
-    m.add_function(wrap_pyfunction!(start_app, m)?)?;
+    m.add_function(wrap_pyfunction!(start_server, m)?)?;
+    m.add_class::<Config>()?;
+    m.add_class::<Scope>()?;
     Ok(())
 }

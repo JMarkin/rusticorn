@@ -24,7 +24,7 @@ html = """
         <ul id='messages'>
         </ul>
         <script>
-            var ws = new WebSocket("wss://localhost:8000/ws");
+            var ws = new WebSocket("ws://localhost:8000/ws");
             ws.onmessage = function(event) {
                 var messages = document.getElementById('messages')
                 var message = document.createElement('li')
@@ -61,4 +61,8 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == '__main__':
     import rusticorn
 
-    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key.pem")
+    rusticorn.run(
+        app,
+        "0.0.0.0:8000",
+        "http1",
+    )

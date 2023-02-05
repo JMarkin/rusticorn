@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Union
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 FORMAT = '%(message)s'
@@ -20,7 +20,12 @@ class Item(BaseModel):
 
 
 @app.get("/")
-def read_root():
+async def read_root(req: Request):
+    return {"Hello": "World"}
+
+
+@app.get("/sync")
+def read_root_sync():
     return {"Hello": "World"}
 
 
@@ -37,4 +42,10 @@ def update_item(item_id: int, item: Item):
 if __name__ == '__main__':
     import rusticorn
 
-    rusticorn.run(app, "0.0.0.0:8000", True, "./examples/certs/localhost.pem", "./examples/certs/localhost-key.pem")
+    rusticorn.run(
+        app,
+        "0.0.0.0:8000",
+        "http2",
+        "./examples/certs/localhost.pem",
+        "./examples/certs/localhost-key.pem",
+    )
