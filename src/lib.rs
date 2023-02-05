@@ -11,31 +11,18 @@ mod scope;
 mod server;
 mod utils;
 
-use std::thread;
-
-use server::ASGIServer;
-use tokio::sync::mpsc::{channel, unbounded_channel};
-
 use crate::prelude::*;
 
 #[pyfunction]
-fn start_server(py: Python, cfg: Config) -> Result<ASGIServer> {
-    let (tx, rx) = unbounded_channel();
-    let (stop_tx, stop_rx) = channel::<bool>(1);
-    py.allow_threads(move || {
-        thread::spawn(move || {
-            pyo3::prepare_freethreaded_python();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build runtime");
+fn start_server(cfg: Config) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.workers)
+        .enable_all()
+        .build()
+        .expect("build runtime");
 
-            let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, crate::server::start_server(cfg, tx, stop_tx))
-        })
-    });
-
-    Ok(ASGIServer::new(rx, stop_rx))
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, crate::server::start_server(cfg))
 }
 
 #[pymodule]

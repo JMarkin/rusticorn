@@ -14,6 +14,14 @@ fn default_ping_timeout() -> f32 {
     20.0
 }
 
+fn default_workers() -> usize {
+    1
+}
+
+fn default_backlog() -> u32 {
+    2048
+}
+
 #[pyclass(module = "rusticorn")]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -21,6 +29,13 @@ pub struct Config {
     pub bind: String,
     #[serde(default)]
     pub http_version: HttpVersion,
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+    #[serde(default = "default_backlog")]
+    pub backlog: u32,
+    #[serde(default)]
+    pub reuse_port: Option<bool>,
+
     #[serde(default)]
     pub tls: Option<Tls>,
 
@@ -58,6 +73,9 @@ impl Config {
     fn new(
         bind: String,
         http_version: Option<String>,
+        workers: Option<usize>,
+        backlog: Option<u32>,
+        reuse_port: Option<bool>,
         cert_path: Option<String>,
         private_path: Option<String>,
         limit_concurrency: Option<u32>,
@@ -82,9 +100,15 @@ impl Config {
             ping_interval: ws_ping_interval.unwrap_or_else(default_ping_interval),
         };
 
+        let workers = workers.unwrap_or_else(default_workers);
+        let backlog = backlog.unwrap_or_else(default_backlog);
+
         Self {
             bind,
             http_version,
+            workers,
+            backlog,
+            reuse_port,
             tls,
             limit,
             ws,

@@ -271,7 +271,7 @@ async fn serve_ws(
     let (mut ws_tx, ws_rx) = websocket.split();
     let (message_tx, mut message_rx) = unbounded_channel::<Message>();
 
-    let sender_fut = tokio::task::spawn_local(async move {
+    let sender_fut = tokio::spawn(async move {
         while let Some(msg) = message_rx.recv().await {
             trace!("try send {}", msg);
             let is_closed = msg.is_close();
@@ -287,16 +287,16 @@ async fn serve_ws(
         }
     });
 
-    let recv_fut = tokio::task::spawn_local(receive_loop(
+    let recv_fut = tokio::spawn(receive_loop(
         ping_timeout,
         ws_rx,
         recv_tx,
         message_tx.clone(),
     ));
 
-    let send_fut = tokio::task::spawn_local(send_loop(send_rx, message_tx.clone()));
+    let send_fut = tokio::spawn(send_loop(send_rx, message_tx.clone()));
 
-    let ping_fut = tokio::task::spawn_local(ping_loop(ping_interval, message_tx.clone()));
+    let ping_fut = tokio::spawn(ping_loop(ping_interval, message_tx.clone()));
 
     tokio::select! {
         _val = recv_fut => {
@@ -368,7 +368,7 @@ pub fn handle(
                 let (parts, _) = response.into_parts();
                 let mut response = Response::from_parts(parts, "".into());
                 debug!("accepted");
-                tokio::task::spawn_local(serve_ws(
+                tokio::spawn(serve_ws(
                     ws,
                     send_rx,
                     recv_tx,

@@ -5,9 +5,11 @@ use std::fs;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::sync::Mutex;
 use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
@@ -17,14 +19,15 @@ use hyper::Request;
 use std::pin::Pin;
 
 #[derive(Clone, Copy, Debug)]
-struct LocalExec;
+struct RusticornExecutor;
 
-impl<F> hyper::rt::Executor<F> for LocalExec
+impl<F> hyper::rt::Executor<F> for RusticornExecutor
 where
-    F: std::future::Future + 'static,
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
 {
     fn execute(&self, fut: F) {
-        tokio::task::spawn_local(fut);
+        tokio::task::spawn(fut);
     }
 }
 
@@ -54,7 +57,7 @@ impl Service<Request<IncomingBody>> for Svc {
 
 macro_rules! spawn_service {
     ($http_version:expr, $stream:expr, $service:expr) => {
-        tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             if let Err(err) = match $http_version {
                 HttpVersion::HTTP1 => {
                     http1::Builder::new()
@@ -64,7 +67,7 @@ macro_rules! spawn_service {
                         .await
                 }
                 HttpVersion::HTTP2 => {
-                    http2::Builder::new(LocalExec)
+                    http2::Builder::new(RusticornExecutor)
                         .keep_alive_interval(Some(Duration::from_millis(100)))
                         .serve_connection($stream, $service)
                         .await
@@ -120,11 +123,9 @@ impl ASGIServer {
 
 const HTTP2_ALPN: [u8; 2] = [104, 50];
 
-pub async fn start_server(
-    cfg: Config,
-    tx: UnboundedSender<ScopeRecvSend>,
-    stop_tx: Sender<bool>,
-) -> Result<()> {
+pub async fn start_server(cfg: Config) -> Result<()> {
+    let (tx, rx) = unbounded_channel();
+    let (stop_tx, stop_rx) = channel::<bool>(1);
     let mut acceptor = None;
     if let Some(tls) = cfg.tls.clone() {
         acceptor = Some({
@@ -158,7 +159,16 @@ pub async fn start_server(
     }
 
     let addr: SocketAddr = cfg.bind.parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    socket.set_reuseport(cfg.reuse_port.unwrap_or(false))?;
+    socket.bind(addr)?;
+
+    let listener = socket.listen(cfg.backlog)?;
     info!(
         "Listening on http{}://{}",
         if cfg.tls.is_some() { "s" } else { "" },
@@ -167,7 +177,7 @@ pub async fn start_server(
 
     let (shutdown_send, mut shutdown_recv) = tokio::sync::mpsc::channel::<bool>(1);
 
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         loop {
             let (stream, peer_addr) = listener.accept().await.expect("can't listen");
 
